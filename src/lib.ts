@@ -29,12 +29,38 @@ import type { EntryType } from "@typesafe-ai/sdk";
 export const MAX_CHOICE_OPTIONS = 255;
 
 /**
+ * Jev's request budget in tokens, shared by the state and all questions. The
+ * docs put it at "around 32,000 tokens, roughly 150,000 characters of English"
+ * (docs.typesafe.ai/primitives), and the OpenRouter catalog lists a 32,000
+ * context window. Reported by jev_models so a caller can size a call before
+ * building it. Approximate on purpose: a measured probe showed terse,
+ * repetitive text costing about 2 characters per token, where English prose
+ * runs nearer 4, so a character count is only a proxy.
+ */
+export const CONTEXT_TOKENS = 32_000;
+
+/**
+ * A Score question accepts up to 10 levels. This is a documented API limit
+ * (docs.typesafe.ai/primitives/score, "up to 10"), confirmed on the wire: 11
+ * levels returns HTTP 400, "Too many score levels. Must have at most 10
+ * levels." Enforcing it locally keeps a request that the API would always
+ * reject from costing a round trip.
+ */
+export const MAX_SCORE_LEVELS = 10;
+
+/**
  * Local safety caps, not API limits. They bound cost and latency for a single
  * call so a malformed loop cannot run up a bill. All three are configurable.
+ *
+ * The state default tracks Jev's context budget: the request's tokens are
+ * shared between `state` and the questions, around 32,000 tokens — roughly
+ * 150,000 characters of English text (docs.typesafe.ai/primitives, "Ask
+ * multiple questions together"). A state past the budget fails at the API,
+ * so the local default sits just under it. The API remains the real enforcer;
+ * raise the cap only if your state packs tighter than English prose.
  */
-export const DEFAULT_MAX_SCORE_LEVELS = 255;
 export const DEFAULT_MAX_QUESTIONS = 64;
-export const DEFAULT_MAX_STATE_CHARS = 200_000;
+export const DEFAULT_MAX_STATE_CHARS = 150_000;
 export const DEFAULT_TIMEOUT_MS = 15_000;
 
 // ── Environment parsing ─────────────────────────────────────────────────────
@@ -54,10 +80,13 @@ export interface ParsedNumber {
 export function readPositiveInt(raw: string | undefined, fallback: number, label: string): ParsedNumber {
   if (raw === undefined || raw.trim() === "") return { value: fallback };
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return { value: fallback, warning: `${label} must be a positive number; got ${JSON.stringify(raw)}. Using ${fallback}.` };
+  // A fractional value is not a smaller limit, it is a different one: 0.5 used
+  // to floor to 0 and silently disable the cap it was meant to tighten (a 0ms
+  // timeout aborts every call). Only a whole number of at least 1 is usable.
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return { value: fallback, warning: `${label} must be a whole number of at least 1; got ${JSON.stringify(raw)}. Using ${fallback}.` };
   }
-  return { value: Math.floor(parsed) };
+  return { value: parsed };
 }
 
 // ── Choice option handling ──────────────────────────────────────────────────
@@ -121,7 +150,19 @@ export function buildChoiceCriteria(
   return { criteria, noneKey };
 }
 
-/** Reject duplicate question ids rather than letting a later one shadow an earlier one. */
+/**
+ * Reject duplicate or unusable question ids rather than letting one vanish.
+ *
+ * Duplicates are refused because answers are keyed by id, so a repeat would
+ * silently drop every earlier question sharing it.
+ *
+ * `__proto__` is refused because it is not an ordinary key anywhere in the
+ * path: assigning it to a plain object sets the prototype instead of creating a
+ * property, and zod's record parsing drops it even from a null-prototype input
+ * (verified). The question would leave the request, or the answer would leave
+ * the response, without an error. Refusing it keeps the promise that nothing is
+ * silently dropped.
+ */
 export function assertUniqueIds(ids: readonly string[]): void {
   const seen = new Set<string>();
   const duplicates = new Set<string>();
@@ -135,6 +176,11 @@ export function assertUniqueIds(ids: readonly string[]): void {
         "Answers are keyed by id, so a repeat would silently drop every earlier question sharing it.",
     );
   }
+  if (seen.has("__proto__")) {
+    throw new Error(
+      'Question id "__proto__" is not usable: it is not an ordinary key in JavaScript objects or in the answer schema, so the question or its answer would be dropped without an error. Use a different id.',
+    );
+  }
 }
 
 // ── Size guards ─────────────────────────────────────────────────────────────
@@ -145,17 +191,31 @@ export function stateSize(state: unknown): number {
 }
 
 /**
- * Reject oversized state instead of truncating it.
+ * Text the request will send: the state plus every question.
+ *
+ * Both share one budget, so measuring the state alone would let an unbounded
+ * instruction escape the documented per-call bound.
+ */
+export function requestSize(state: unknown, questions?: unknown): number {
+  return stateSize(state) + (questions === undefined ? 0 : stateSize(questions));
+}
+
+/**
+ * Reject an oversized request instead of truncating it.
  *
  * Truncation silently changes the material the judgment rests on, which turns a
  * size problem into a wrong answer. Failing loudly keeps the caller in control.
+ * The state and the questions share Jev's ~32k-token budget, so both count.
  */
-export function assertStateWithinLimit(state: unknown, maxChars: number): void {
-  const size = stateSize(state);
-  if (size > maxChars) {
+export function assertRequestWithinLimit(state: unknown, questions: unknown, maxChars: number): void {
+  const stateChars = stateSize(state);
+  const questionChars = questions === undefined ? 0 : stateSize(questions);
+  const total = stateChars + questionChars;
+  if (total > maxChars) {
     throw new Error(
-      `State is ${size} characters, above the ${maxChars} limit. ` +
-        "Shorten it or select the relevant part first; raise JEV_MAX_STATE_CHARS if the limit is wrong for your workload.",
+      `Request text is ${total} characters (state ${stateChars} + questions ${questionChars}), above the ${maxChars} limit. ` +
+        "Jev's request budget is about 32,000 tokens shared by the state and every question, so filter in code first: send the paragraph, the diff hunk, the record — not the whole file, log, or transcript — and ask only the questions you need. " +
+        "Raise JEV_MAX_STATE_CHARS only if your text packs tighter than English prose; the API rejects a genuine overflow with max_tokens_exceeded either way.",
     );
   }
 }
@@ -193,11 +253,142 @@ export function gateProbability(probability: number, yesAtOrAbove: number, noAtO
   return "uncertain";
 }
 
+// ── Provider selection ─────────────────────────────────────────────────────
+
+export type ProviderName = "typesafe" | "openrouter";
+
+export interface ResolvedProvider {
+  provider: ProviderName;
+  /** Set when JEV_PROVIDER carried an unusable value and auto-detection was used. */
+  warning?: string;
+}
+
+/**
+ * Decide which API serves the tools.
+ *
+ * An explicit JEV_PROVIDER wins. Without one, prefer the TypeSafe API when any
+ * of its key sources exists (the SDK carries retries and request ids), then
+ * OpenRouter when its key exists, and otherwise default to TypeSafe so a
+ * missing key produces the familiar error. An unusable explicit value warns
+ * and falls through to the same order rather than guessing a provider silently.
+ */
+export function resolveProvider(
+  explicit: string | undefined,
+  typesafeKeyPresent: boolean,
+  openrouterKeyPresent: boolean,
+): ResolvedProvider {
+  if (explicit !== undefined && explicit.trim() !== "") {
+    const value = explicit.trim().toLowerCase();
+    if (value === "typesafe" || value === "openrouter") return { provider: value };
+    return {
+      provider: autoProvider(typesafeKeyPresent, openrouterKeyPresent),
+      warning: `JEV_PROVIDER must be "typesafe" or "openrouter"; got ${JSON.stringify(explicit)}. Using auto-detection.`,
+    };
+  }
+  return { provider: autoProvider(typesafeKeyPresent, openrouterKeyPresent) };
+}
+
+function autoProvider(typesafeKeyPresent: boolean, openrouterKeyPresent: boolean): ProviderName {
+  if (typesafeKeyPresent) return "typesafe";
+  if (openrouterKeyPresent) return "openrouter";
+  return "typesafe";
+}
+
+/**
+ * Whether a bare file looks like an OpenRouter key.
+ *
+ * `~/.openrouter` is a path some operators already keep a key in. A file there
+ * is only used when its content actually looks like a key, so an unrelated file
+ * at that path is ignored instead of being sent as a credential.
+ */
+export function looksLikeOpenRouterKey(value: string): boolean {
+  return /^sk-or-[A-Za-z0-9._-]{8,}$/.test(value.trim());
+}
+
+// ── Retry helpers (pure, so the policy is unit-testable) ─────────────────────
+
+/**
+ * Parse the delay a provider asks for, mirroring the TypeSafe SDK's policy:
+ * `retry-after-ms` wins, then `Retry-After` as seconds, then as an HTTP date.
+ * A delay above the cap is ignored rather than obeyed, so a header cannot stall
+ * an MCP call; the caller falls back to exponential backoff.
+ */
+export const MAX_RETRY_AFTER_MS = 60_000;
+
+export function parseRetryAfterMs(
+  retryAfterMs: string | null | undefined,
+  retryAfter: string | null | undefined,
+  nowMs = 0,
+): number | null {
+  if (retryAfterMs !== null && retryAfterMs !== undefined && retryAfterMs.trim() !== "") {
+    const ms = Number(retryAfterMs);
+    if (Number.isFinite(ms) && ms >= 0) return ms <= MAX_RETRY_AFTER_MS ? ms : null;
+  }
+  if (retryAfter === null || retryAfter === undefined || retryAfter.trim() === "") return null;
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds)) {
+    if (seconds < 0) return null;
+    const total = seconds * 1000;
+    return total <= MAX_RETRY_AFTER_MS ? total : null;
+  }
+  const date = Date.parse(retryAfter);
+  if (Number.isNaN(date)) return null;
+  const delta = Math.max(0, date - nowMs);
+  return delta <= MAX_RETRY_AFTER_MS ? delta : null;
+}
+
+/** The SDK's backoff shape, so both routes wait the same way. */
+export const BACKOFF_INITIAL_MS = 500;
+export const BACKOFF_MAX_MS = 5_000;
+export const BACKOFF_JITTER = 0.25;
+
+/** Delay before retry N (0-based): 500ms doubling to a 5s cap, with 25% jitter. */
+export function backoffDelayMs(attempt: number, random: () => number = Math.random): number {
+  const exponential = Math.min(BACKOFF_INITIAL_MS * 2 ** attempt, BACKOFF_MAX_MS);
+  return Math.round(exponential * (1 - random() * BACKOFF_JITTER));
+}
+
+// ── Errors raised by the OpenRouter provider ────────────────────────────────
+
+/**
+ * An HTTP failure from the OpenRouter API, carrying what describeError needs.
+ * The body's `error.message` is extracted when present, since that is where
+ * OpenRouter nests the provider's own validation detail.
+ */
+export class ProviderHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly requestId?: string,
+    readonly retryAfterSeconds?: number | null,
+  ) {
+    super(message);
+    this.name = "ProviderHttpError";
+  }
+}
+
+/** The per-attempt timeout (AbortSignal.timeout) fired before a response. */
+export class ProviderTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProviderTimeoutError";
+  }
+}
+
+/** fetch failed before a response arrived: DNS, connection, TLS. */
+export class ProviderNetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProviderNetworkError";
+  }
+}
+
 // ── Error reporting ─────────────────────────────────────────────────────────
 
 export type ErrorKind =
   | "no_api_key"
   | "authentication"
+  | "insufficient_credits"
   | "permission_denied"
   | "invalid_request"
   | "not_found"
@@ -223,6 +414,13 @@ export interface DescribedError {
 }
 
 /**
+ * What an exhausted balance means, shared by both routes so the same HTTP
+ * status yields the same kind and advice whichever API answered.
+ */
+const INSUFFICIENT_CREDITS_HINT =
+  "The provider account cannot afford this request, so retrying it unchanged will fail the same way. Add credits (openrouter.ai/settings/credits on the OpenRouter path) or send a smaller request. A full-budget Jev request costs well under a cent, so this usually means a shared account balance is exhausted rather than Jev being expensive.";
+
+/**
  * Classify a failure so a caller can branch on it.
  *
  * Flattening every failure to a string makes a missing key, a malformed
@@ -232,6 +430,45 @@ export interface DescribedError {
 export function describeError(error: unknown): DescribedError {
   const message = error instanceof Error ? error.message : String(error);
 
+  if (error instanceof ProviderHttpError) {
+    const base = { message, status: error.status, requestId: error.requestId };
+    if (error.status === 401) {
+      return { ...base, kind: "authentication", retryable: false, hint: "The API key was rejected. Check the key for the active provider (TYPESAFE_API_KEY or OPENROUTER_API_KEY) in the server's environment." };
+    }
+    if (error.status === 402) {
+      return {
+        ...base,
+        kind: "insufficient_credits",
+        retryable: false,
+        hint: INSUFFICIENT_CREDITS_HINT,
+      };
+    }
+    if (error.status === 403) {
+      return { ...base, kind: "permission_denied", retryable: false, hint: "The key is valid but lacks access to this model or account." };
+    }
+    if (error.status === 404) {
+      return { ...base, kind: "not_found", retryable: false, hint: "Check the model id in JEV_MODEL. On OpenRouter the Jev ids are typesafe/jev-1.13 and the ~typesafe/jev-latest alias." };
+    }
+    if (error.status === 408) {
+      return { ...base, kind: "timeout", retryable: true, hint: "The provider reported a request timeout. Retry, shorten the state, or raise JEV_TIMEOUT_MS." };
+    }
+    if (error.status === 429) {
+      return { ...base, kind: "rate_limit", retryable: true, hint: "Rate limited after this server's own retries. Back off before trying again." };
+    }
+    if (error.status === 400 || error.status === 422) {
+      return { ...base, kind: "invalid_request", retryable: false, hint: "The request failed validation. The message names the offending field." };
+    }
+    return { ...base, kind: "server_error", retryable: error.status >= 500, hint: "The provider returned an error. Retry if it persists." };
+  }
+  if (error instanceof ProviderTimeoutError) {
+    return { kind: "timeout", message, retryable: true, hint: "Shorten the state or raise JEV_TIMEOUT_MS." };
+  }
+  if (error instanceof ProviderNetworkError) {
+    return { kind: "connection", message, retryable: true, hint: "Check network access to openrouter.ai." };
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return { kind: "cancelled", message, retryable: false, hint: "The client cancelled the request." };
+  }
   if (error instanceof MalformedResponseError) {
     return {
       kind: "malformed_response",
@@ -260,6 +497,14 @@ export function describeError(error: unknown): DescribedError {
     if (error instanceof AuthenticationError) {
       return { ...base, kind: "authentication", retryable: false, hint: "The API key was rejected. Check TYPESAFE_API_KEY in the server's environment." };
     }
+    if (error.status === 402) {
+      return {
+        ...base,
+        kind: "insufficient_credits",
+        retryable: false,
+        hint: INSUFFICIENT_CREDITS_HINT,
+      };
+    }
     if (error instanceof PermissionDeniedError) {
       return { ...base, kind: "permission_denied", retryable: false, hint: "The key is valid but lacks access to this model or account." };
     }
@@ -280,7 +525,7 @@ export function describeError(error: unknown): DescribedError {
       kind: "no_api_key",
       message,
       retryable: false,
-      hint: "Set TYPESAFE_API_KEY in the environment of the MCP client, not as a tool argument. Many clients filter the environment, so pass it explicitly when registering the server.",
+      hint: "Set the key for the active provider (TYPESAFE_API_KEY, or OPENROUTER_API_KEY when JEV_PROVIDER=openrouter) in the environment of the MCP client, not as a tool argument. Many clients filter the environment, so a key file or an explicit env entry when registering the server is more reliable.",
     };
   }
 
@@ -379,10 +624,17 @@ export function validateScoreAnswer(answer: unknown, levelCount: number, label: 
     throw new MalformedResponseError(`Answer '${label}' has no legend.`);
   }
   const legendKeys = Object.keys(a.legend as Record<string, unknown>);
-  if (legendKeys.length !== levelCount) {
-    throw new MalformedResponseError(`Answer '${label}' has a legend of ${legendKeys.length} levels; the question sent ${levelCount}.`);
+  // The levels were sent as positions 0..n-1, and the API keys the legend by
+  // those numbers. Checking only the count accepted a same-length legend with
+  // foreign keys, so a caller keying probabilities by level index could act on
+  // a rubric it never sent. The identity of the keys is the question here.
+  const expectedKeys = Array.from({ length: levelCount }, (_, i) => String(i));
+  if (!sameKeySet(legendKeys, expectedKeys)) {
+    throw new MalformedResponseError(
+      `Answer '${label}' has a legend for ${JSON.stringify(legendKeys)}, but the question sent ${levelCount} levels keyed ${JSON.stringify(expectedKeys)}.`,
+    );
   }
-  checkDistribution(a.probabilities, legendKeys, label);
+  checkDistribution(a.probabilities, expectedKeys, label);
 }
 
 /** Check a Noul answer: one finite probability in [0, 1]. */

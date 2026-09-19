@@ -2,18 +2,19 @@
   "name": "jev",
   "displayName": "TypeSafe Jev",
   "description": "Typed, calibrated judgments from TypeSafe Jev: classify, score, check, a batched multi-question ask, and model discovery.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "author": {
-    "name": "rashed parvez"
+    "name": "rahul rajaram"
   },
-  "homepage": "https://github.com/rashedInt32/jev-mcp",
-  "repository": "https://github.com/rashedInt32/jev-mcp",
+  "homepage": "https://github.com/rahulrajaram/jev-mcp",
+  "repository": "https://github.com/rahulrajaram/jev-mcp",
   "license": "MIT",
   "keywords": [
     "mcp",
     "typesafe",
     "jev",
     "system-one",
+    "openrouter",
     "classification",
     "confidence"
   ],
@@ -24,7 +25,7 @@
       "command": "npx",
       "args": [
         "-y",
-        "jev-mcp@0.4.0"
+        "github:rahulrajaram/jev-mcp#main"
       ]
     }
   }

@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { payload, startMock, withClient } from "./helpers.mjs";
+import { payload, startMock, startMockOpenRouter, withClient } from "./helpers.mjs";
 
 const TOOLS = ["jev_ask", "jev_check", "jev_classify", "jev_models", "jev_score"];
 
@@ -28,6 +28,26 @@ test("every tool documents itself and declares both input and output schemas", a
       assert.ok(tool.inputSchema, `${tool.name} has no inputSchema`);
       assert.equal(tool.inputSchema.type, "object");
       assert.ok(tool.outputSchema, `${tool.name} has no outputSchema, so callers get an opaque string`);
+    }
+  });
+});
+
+test("every judgment tool carries the when-to-use / when-not-to-use scope guide", async () => {
+  // Agents read tool descriptions without ever opening the skill, so the
+  // three-way test (answer it yourself / call the tools / write SDK code) must
+  // ship in the tools/list payload itself. Missing scope guidance was the
+  // gap behind agents reaching for a one-off judgment to look rigorous.
+  await withClient({ withKey: false }, async (client) => {
+    const { tools } = await client.listTools();
+    const judgment = tools.filter((t) => t.name !== "jev_models");
+    assert.equal(judgment.length, 4);
+    for (const tool of judgment) {
+      for (const marker of ["WHEN TO USE:", "WHEN NOT TO USE:", "one-off judgment", "SDK code"]) {
+        assert.ok(
+          tool.description?.includes(marker),
+          `${tool.name} must mention "${marker}" so the scope guide survives in its description`,
+        );
+      }
     }
   });
 });
@@ -316,7 +336,7 @@ test("API failures are classified so a caller can tell retryable from terminal",
   const mock = await startMock();
   try {
     await withClient({ baseUrl: mock.url }, async (client) => {
-      mock.state.status = 401;
+      mock.state.badKey = true;
       const unauthorized = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
       assert.equal(unauthorized.isError, true);
       const { error } = payload(unauthorized);
@@ -336,6 +356,14 @@ test("jev_models reports the active model and what the key can use", async () =>
       const body = payload(await client.callTool({ name: "jev_models", arguments: {} }));
       assert.equal(body.active_model, "jev-latest");
       assert.equal(body.models[0].name, "jev-latest");
+      // A caller should be able to size a call from one cheap call.
+      assert.deepEqual(body.limits, {
+        context_tokens: 32000,
+        max_state_chars: 150000,
+        max_questions: 64,
+        max_choice_options: 255,
+        max_score_levels: 10,
+      });
     });
   } finally {
     await mock.close();
@@ -431,5 +459,466 @@ test("every judgment tool reports the round-trip latency", async () => {
     });
   } finally {
     await mock.close();
+  }
+});
+
+// ── Jev's real limits, enforced locally ─────────────────────────────────────
+
+test("regression: a Score question with more than 10 levels fails before any request", async () => {
+  // Wire-confirmed: the API answers 400, "Too many score levels. Must have at
+  // most 10 levels." Rejecting locally keeps a doomed request from costing a
+  // round trip.
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      const eleven = Array.from({ length: 11 }, (_, i) => `level ${i}`);
+      const result = await client.callTool({ name: "jev_score", arguments: { state: "s", question: "q", levels: eleven } });
+      assert.equal(result.isError, true);
+      assert.match(payload(result).error.message, /at most 10 entries/);
+      assert.equal(mock.requests.length, 0, "no request should reach the API");
+
+      const ten = Array.from({ length: 10 }, (_, i) => `level ${i}`);
+      const okResult = await client.callTool({ name: "jev_score", arguments: { state: "s", question: "q", levels: ten } });
+      assert.notEqual(okResult.isError, true, "exactly ten levels must pass");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: jev_ask rejects an oversized level list naming the question", async () => {
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      const result = await client.callTool({
+        name: "jev_ask",
+        arguments: {
+          state: "s",
+          questions: [{ id: "big", type: "score", question: "q", levels: Array.from({ length: 11 }, (_, i) => `l${i}`) }],
+        },
+      });
+      assert.equal(result.isError, true);
+      assert.match(payload(result).error.message, /'big'.*at most 10/);
+      assert.equal(mock.requests.length, 0);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("the default state cap tracks Jev's context budget", async () => {
+  // Jev's request budget is ~32k tokens shared by state and questions, roughly
+  // 150,000 characters of English. The local default sits just under it.
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      const justUnder = await client.callTool({ name: "jev_check", arguments: { state: "x".repeat(149_000), question: "q" } });
+      assert.notEqual(justUnder.isError, true, "149k characters is within the default cap");
+
+      const over = await client.callTool({ name: "jev_check", arguments: { state: "x".repeat(150_001), question: "q" } });
+      assert.equal(over.isError, true);
+      assert.match(payload(over).error.message, /150000/);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+// ── The OpenRouter provider ──────────────────────────────────────────────
+
+test("auto-selects the OpenRouter provider when only its key is present", async () => {
+  const mock = await startMockOpenRouter();
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "Is this fine?" } });
+      assert.notEqual(result.isError, true);
+
+      const sent = mock.decisions();
+      assert.equal(sent.length, 1, "exactly one decision request");
+      assert.equal(sent[0].url, "/api/alpha/decisions");
+      assert.match(sent[0].auth, /^Bearer sk-or-test$/, "the key must travel in the header, never the body");
+      assert.equal(sent[0].body.model, "~typesafe/jev-latest", "the OpenRouter default model id");
+      assert.equal(sent[0].body.state, "s");
+      assert.equal(sent[0].body.questions.check.type, "noul");
+
+      const body = payload(result);
+      assert.equal(body.provider, "openrouter");
+      assert.equal(typeof body.probability_yes, "number");
+      assert.equal(typeof body.usage.cost, "number", "OpenRouter reports the call cost");
+      assert.equal(body.model, "typesafe/jev-1.13-20260917");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("with both keys present the TypeSafe provider wins unless JEV_PROVIDER says otherwise", async () => {
+  const tsMock = await startMock();
+  const orMock = await startMockOpenRouter();
+  try {
+    await withClient(
+      { baseUrl: tsMock.url, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: orMock.url } },
+      async (client) => {
+        const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+        assert.notEqual(result.isError, true);
+        assert.equal(payload(result).provider, "typesafe");
+        assert.equal(tsMock.requests.length, 1);
+        assert.equal(orMock.requests.length, 0, "auto-detection prefers the TypeSafe path");
+      },
+    );
+
+    await withClient(
+      { baseUrl: tsMock.url, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: orMock.url, JEV_PROVIDER: "openrouter" } },
+      async (client) => {
+        const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+        assert.notEqual(result.isError, true);
+        assert.equal(payload(result).provider, "openrouter", "an explicit JEV_PROVIDER overrides auto-detection");
+        assert.equal(orMock.decisions().length, 1);
+      },
+    );
+  } finally {
+    await tsMock.close();
+    await orMock.close();
+  }
+});
+
+test("falls back to the OpenRouter key file when the environment carries no key", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const keyFile = join(mkdtempSync(join(tmpdir(), "jev-or-key-")), "key");
+  writeFileSync(keyFile, "  sk-or-file\n", { mode: 0o600 });
+
+  const mock = await startMockOpenRouter();
+  try {
+    await withClient({ withKey: false, env: { OPENROUTER_BASE_URL: mock.url, JEV_OR_KEY_FILE: keyFile } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.notEqual(result.isError, true, "the key file should satisfy the credential check");
+      assert.match(mock.decisions()[0].auth, /sk-or-file/);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("a rejected OpenRouter key is an authentication error, never retried", async () => {
+  const mock = await startMockOpenRouter();
+  mock.state.badKey = true;
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.equal(result.isError, true);
+      const { error } = payload(result);
+      assert.equal(error.kind, "authentication");
+      assert.equal(error.retryable, false);
+      assert.equal(mock.decisions().length, 1, "a 401 must not be retried");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("a rate-limited OpenRouter request is retried after Retry-After and then succeeds", async () => {
+  const mock = await startMockOpenRouter();
+  mock.state.failNext = { status: 429, times: 1, retryAfter: 0 };
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.notEqual(result.isError, true, "the retry must recover the call");
+      assert.equal(mock.decisions().length, 2, "exactly one retry");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("a persistently failing OpenRouter request stops after three attempts", async () => {
+  const mock = await startMockOpenRouter();
+  mock.state.failNext = { status: 500, times: 10, retryAfter: 0 };
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.equal(result.isError, true);
+      const { error } = payload(result);
+      assert.equal(error.kind, "server_error");
+      assert.equal(error.retryable, true);
+      assert.equal(mock.decisions().length, 3, "three attempts, then a classified failure");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("an out-of-credits OpenRouter account (402) is named, not retried, and not called a server error", async () => {
+  // OpenRouter answers 402 with limit_source: openrouter_credits when the
+  // balance cannot cover the request. It is not a server fault and retrying
+  // unchanged cannot help, so it must fail fast with its own kind.
+  const mock = await startMockOpenRouter();
+  mock.state.failNext = { status: 402, times: 10 };
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.equal(result.isError, true);
+      const { error } = payload(result);
+      assert.equal(error.kind, "insufficient_credits");
+      assert.equal(error.retryable, false);
+      assert.match(error.hint, /credit/i);
+      assert.equal(mock.decisions().length, 1, "a balance problem must not burn retries");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("an invalid OpenRouter request fails fast without a retry", async () => {
+  const mock = await startMockOpenRouter();
+  mock.state.failNext = { status: 400, times: 10 };
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.equal(result.isError, true);
+      const { error } = payload(result);
+      assert.equal(error.kind, "invalid_request");
+      assert.equal(error.retryable, false);
+      assert.equal(mock.decisions().length, 1, "a validation failure must not be retried");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("jev_models over OpenRouter proves the key and lists the Jev family", async () => {
+  const mock = await startMockOpenRouter();
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const body = payload(await client.callTool({ name: "jev_models", arguments: {} }));
+      assert.equal(body.provider, "openrouter");
+      assert.equal(body.active_model, "~typesafe/jev-latest");
+      assert.deepEqual(body.models.map((m) => m.name).sort(), ["typesafe/jev-1.13", "~typesafe/jev-latest"]);
+      for (const m of body.models) assert.match(m.release_date, /^\d{4}-\d{2}-\d{2}$/);
+      assert.ok(mock.requests.some((r) => r.url.includes("/auth/key")), "the key must be proven, not assumed");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+// ── Findings from the jev-answer-fidelity and correctness reviews ────────────
+
+test("regression: a question id of __proto__ is refused, never silently dropped", async () => {
+  // Assigning "__proto__" to a plain object sets the prototype rather than a
+  // property, and zod's record parsing drops the key even from a null-prototype
+  // input, so the question or its answer would vanish with no error.
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      const result = await client.callTool({
+        name: "jev_ask",
+        arguments: { state: "s", questions: [{ id: "__proto__", type: "check", question: "A?" }] },
+      });
+      assert.equal(result.isError, true);
+      const { error } = payload(result);
+      assert.match(error.message, /__proto__/);
+      assert.match(error.message, /dropped without an error/);
+      assert.equal(mock.requests.length, 0, "the question must be refused before any request");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: an inverted act/review pair is refused instead of collapsing the review band", async () => {
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      for (const [tool, args] of [
+        ["jev_classify", { state: "s", question: "q", options: { a: "d", b: "d" } }],
+        ["jev_score", { state: "s", question: "q", levels: ["low", "high"] }],
+      ]) {
+        const result = await client.callTool({ name: tool, arguments: { ...args, act_above: 0.3, review_above: 0.8 } });
+        assert.equal(result.isError, true, `${tool} must refuse inverted thresholds`);
+        assert.match(payload(result).error.message, /review band would be unreachable/);
+      }
+      assert.equal(mock.requests.length, 0);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: the jev_ask question cap is enforced, not just advertised", async () => {
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url, env: { JEV_MAX_QUESTIONS: "2" } }, async (client) => {
+      const result = await client.callTool({
+        name: "jev_ask",
+        arguments: {
+          state: "s",
+          questions: [
+            { id: "a", type: "check", question: "A?" },
+            { id: "b", type: "check", question: "B?" },
+            { id: "c", type: "check", question: "C?" },
+          ],
+        },
+      });
+      assert.equal(result.isError, true);
+      assert.match(payload(result).error.message, /at most 2 entries/);
+      assert.equal(mock.requests.length, 0, "the bound must hold before a request is sent");
+
+      const limits = payload(await client.callTool({ name: "jev_models", arguments: {} }));
+      assert.equal(limits.limits.max_questions, 2, "the reported limit must be the effective one");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: an inverted check threshold pair is refused, not silently accepted", async () => {
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      const result = await client.callTool({
+        name: "jev_check",
+        arguments: { state: "s", question: "q", yes_at_or_above: 0.1, no_at_or_below: 0.9 },
+      });
+      assert.equal(result.isError, true);
+      assert.match(payload(result).error.message, /no_at_or_below must not exceed yes_at_or_above/);
+      assert.equal(mock.requests.length, 0);
+
+      const ordered = await client.callTool({
+        name: "jev_check",
+        arguments: { state: "s", question: "q", yes_at_or_above: 0.9, no_at_or_below: 0.1 },
+      });
+      assert.notEqual(ordered.isError, true, "well-ordered thresholds must still pass");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: question text counts against the same budget as the state", async () => {
+  // The state cap alone let an unbounded instruction escape the documented
+  // per-call bound, since the model sees state and questions together.
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url, env: { JEV_MAX_STATE_CHARS: "500" } }, async (client) => {
+      const result = await client.callTool({
+        name: "jev_check",
+        arguments: { state: "small", question: "x".repeat(600) },
+      });
+      assert.equal(result.isError, true);
+      const message = payload(result).error.message;
+      assert.match(message, /Request text is .*state 5 \+ questions/);
+      assert.equal(mock.requests.length, 0);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: the OpenRouter route retries the whole 5xx range, as the SDK does", async () => {
+  const mock = await startMockOpenRouter();
+  mock.state.failNext = { status: 521, times: 1, retryAfter: 0 };
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.notEqual(result.isError, true, "521 must be retried");
+      assert.equal(mock.decisions().length, 2);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: the OpenRouter route retries a per-attempt timeout, as the SDK does", async () => {
+  const mock = await startMockOpenRouter();
+  mock.state.delayNextMs = 400;
+  try {
+    await withClient(
+      { withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url, JEV_TIMEOUT_MS: "120" } },
+      async (client) => {
+        const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+        assert.notEqual(result.isError, true, "the timeout on attempt one must be retried");
+        assert.equal(mock.decisions().length, 2);
+      },
+    );
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: an out-of-credits 402 is named on the TypeSafe route too", async () => {
+  const mock = await startMock();
+  mock.state.failNext = { status: 402, times: 10 };
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.equal(result.isError, true);
+      const { error } = payload(result);
+      assert.equal(error.kind, "insufficient_credits", "the same status must classify the same on both routes");
+      assert.equal(error.retryable, false);
+      assert.match(error.hint, /credit/i);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: the scope guide keeps its substance, not just its markers", async () => {
+  // The guide is the behavioural guard for the whole judgment surface, so a
+  // future edit that kept the markers while permitting arithmetic or one-off
+  // use must fail here.
+  await withClient({ withKey: false }, async (client) => {
+    const { tools } = await client.listTools();
+    for (const tool of tools.filter((t) => t.name !== "jev_models")) {
+      const description = (tool.description ?? "").toLowerCase();
+      for (const substance of ["arithmetic", "counting", "date", "one-off judgment", "sdk code", "deterministic"]) {
+        assert.ok(description.includes(substance), `${tool.name} must still exclude ${substance}`);
+      }
+      assert.ok(description.includes("calibrated probability"), `${tool.name} must state when it is wanted`);
+    }
+  });
+});
+
+test("uses a bare ~/.openrouter key file, and only when it looks like a key", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  // A key at ~/.openrouter is picked up with no configuration at all.
+  const homeWithKey = mkdtempSync(join(tmpdir(), "jev-home-"));
+  writeFileSync(join(homeWithKey, ".openrouter"), "sk-or-v1-" + "a".repeat(64) + "\n", { mode: 0o600 });
+  const mock = await startMockOpenRouter();
+  try {
+    await withClient(
+      { withKey: false, bareKeyFile: null, env: { HOME: homeWithKey, OPENROUTER_BASE_URL: mock.url, JEV_OR_KEY_FILE: "/nonexistent/jev-mcp-test/or-key" } },
+      async (client) => {
+        const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+        assert.notEqual(result.isError, true, "the bare key file should satisfy the credential check");
+        assert.equal(payload(result).provider, "openrouter");
+        assert.match(mock.decisions()[0].auth, /^Bearer sk-or-v1-aaaa/);
+      },
+    );
+  } finally {
+    await mock.close();
+  }
+
+  // A file there that is not a key must not be sent as a credential.
+  const homeWithout = mkdtempSync(join(tmpdir(), "jev-home-"));
+  writeFileSync(join(homeWithout, ".openrouter"), "some other tool's config\n");
+  const mock2 = await startMockOpenRouter();
+  try {
+    await withClient(
+      { withKey: false, bareKeyFile: null, env: { HOME: homeWithout, OPENROUTER_BASE_URL: mock2.url, JEV_OR_KEY_FILE: "/nonexistent/jev-mcp-test/or-key" } },
+      async (client) => {
+        const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+        assert.equal(result.isError, true);
+        assert.equal(payload(result).error.kind, "no_api_key", "a non-key file must be ignored, not used");
+        assert.equal(mock2.requests.length, 0);
+      },
+    );
+  } finally {
+    await mock2.close();
   }
 });
