@@ -32,6 +32,26 @@ test("every tool documents itself and declares both input and output schemas", a
   });
 });
 
+test("every judgment tool carries the when-to-use / when-not-to-use scope guide", async () => {
+  // Agents read tool descriptions without ever opening the skill, so the
+  // three-way test (answer it yourself / call the tools / write SDK code) must
+  // ship in the tools/list payload itself. Missing scope guidance was the
+  // gap behind agents reaching for a one-off judgment to look rigorous.
+  await withClient({ withKey: false }, async (client) => {
+    const { tools } = await client.listTools();
+    const judgment = tools.filter((t) => t.name !== "jev_models");
+    assert.equal(judgment.length, 4);
+    for (const tool of judgment) {
+      for (const marker of ["WHEN TO USE:", "WHEN NOT TO USE:", "one-off judgment", "SDK code"]) {
+        assert.ok(
+          tool.description?.includes(marker),
+          `${tool.name} must mention "${marker}" so the scope guide survives in its description`,
+        );
+      }
+    }
+  });
+});
+
 test("classify requires caller-supplied options, so the model cannot invent one", async () => {
   await withClient({ withKey: false }, async (client) => {
     const { tools } = await client.listTools();

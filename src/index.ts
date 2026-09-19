@@ -434,6 +434,26 @@ function fail(error: unknown) {
 
 const server = new McpServer({ name: "jev", version: VERSION });
 
+// ── Scope guidance shared by every judgment tool ────────────────────────────
+
+/**
+ * Appended to each judgment tool's description so an agent that never opens the
+ * skill still learns the three-way test from the tool listing itself: answer it
+ * yourself, call these tools, or write SDK code.
+ *
+ * Keep this terse — it ships in every tools/list response — but do not trim the
+ * exclusions; they are the part agents get wrong. A number and a label look
+ * rigorous, which is exactly why a one-off judgment that an ordinary argued
+ * answer would serve better must not reach for them.
+ */
+const SCOPE_GUIDE =
+  "WHEN TO USE: the same semantic judgment repeats across many items (triaging many files, ranking many candidates, checking each claim against its source, scoring each requirement against a diff), or you specifically need a calibrated probability to threshold a decision on. " +
+  "WHEN NOT TO USE: (1) a one-off judgment you can reason out yourself in conversation — an ordinary answer carries an argument the user can push back on, and Jev returns a number and a label, which is weaker in dialogue; do not reach for a tool to look rigorous; " +
+  "(2) anything a deterministic check, query, or measurement can decide — run that instead; a probability cannot improve on ground truth and only adds anchoring; " +
+  "(3) arithmetic, counting, or date comparison — Jev has no scratchpad and fails these confidently; compute in code and pass the result in as a fact; " +
+  "(4) logic that must run inside the user's application — that belongs in SDK code under test, not in a tool call. " +
+  "Always report the answer WITH its confidence and what you did about it; treat review/uncertain as 'look at the evidence yourself', never as a soft yes.";
+
 // ── classify: one of a defined set ─────────────────────────────────────────
 
 server.registerTool(
@@ -442,7 +462,8 @@ server.registerTool(
     title: "Classify into one of your options",
     description:
       "Pick exactly one option from a set you define. Returns the chosen option, the probability of every option, a confidence value, and a recommended action gated on confidence. " +
-      "Use when the answer is one of a fixed set. The options must be supplied by you: Jev selects among them and cannot invent a new one. Up to 255 options.",
+      "Use when the answer is one of a fixed set. The options must be supplied by you: Jev selects among them and cannot invent a new one. Up to 255 options. " +
+      SCOPE_GUIDE,
     inputSchema: {
       state: StateSchema,
       question: InstructionSchema,
@@ -511,7 +532,8 @@ server.registerTool(
     title: "Rate on an ordered scale",
     description:
       "Rate the state along an ordered scale you define. Returns a probability-weighted score that can land between levels, the distribution, confidence, and a recommended action. " +
-      "Use for degree or severity, not for picking a category.",
+      "Use for degree or severity, not for picking a category. " +
+      SCOPE_GUIDE,
     inputSchema: {
       state: StateSchema,
       question: InstructionSchema,
@@ -580,7 +602,8 @@ server.registerTool(
     title: "Yes/no with a probability",
     description:
       "Ask a yes/no question. Returns the probability that the answer is yes, from 0 to 1, plus a verdict. There is no separate confidence: a value near 0.5 means yes and no are close to equally likely, not that the answer is 'medium'. " +
-      "Use one check per label when several labels may apply at once.",
+      "Use one check per label when several labels may apply at once. " +
+      SCOPE_GUIDE,
     inputSchema: {
       state: StateSchema,
       question: InstructionSchema,
@@ -645,7 +668,9 @@ server.registerTool(
       "Ask several independent questions about the same state in ONE request. Jev prefills the state once and scores every question in a single forward pass, so extra questions add almost no latency. " +
       "Questions share the request's ~32,000-token budget with the state, so filter the state before adding questions rather than growing the call. " +
       "Prefer this over repeated single-question calls: on a document-dominated workload it is dramatically cheaper and faster with no change in answers. " +
-      "Questions cannot see each other's answers, so state any speculative premise explicitly and let your own logic decide which answers apply.",
+      "Questions cannot see each other's answers, so state any speculative premise explicitly and let your own logic decide which answers apply. " +
+      "One state, one subject: do not batch questions about unrelated subjects. " +
+      SCOPE_GUIDE,
     inputSchema: {
       state: StateSchema,
       questions: z
