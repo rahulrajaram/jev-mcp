@@ -185,9 +185,11 @@ premise explicitly and let your own code decide which answers apply.
    be honoured exactly fails with a reason instead of quietly changing meaning.
 5. **Only JSON-RPC reaches stdout.** Logs go to stderr, always.
 6. **Every answer is checked against the question sent.** A choice that was never
-   offered, a distribution over the wrong options, a legend that does not match the
-   levels, or a missing answer in a batch is an error of kind `malformed_response`,
-   never a result. A caller that trusted the label alone would otherwise execute
+   offered, a distribution over the wrong options, a legend whose keys are not the
+   level positions actually sent, or a missing answer in a batch is an error of kind
+   `malformed_response`, never a result. A caller that trusted the label alone would
+   otherwise execute something it never proposed. An action is only ever gated on a
+   confidence the primitive actually has, so a stray field cannot invent one.
    something it never proposed.
 
 ### The no-match option
@@ -222,11 +224,14 @@ Failures come back with `isError` and a classified body: `kind`, `retryable`, an
 where available `status`, `requestId`, and a `hint`. A rejected key (`authentication`,
 never retryable) is distinguishable from a rate limit (`rate_limit`, retryable) and
 from a malformed question (`invalid_request`) and from an answer that fails validation
-against the question (`malformed_response`, retryable, nothing to act on). Both
-providers are retried before an error surfaces here: the TypeSafe SDK does it on its
-path, and the OpenRouter client retries 408, 429, and 5xx with exponential backoff,
-honouring `Retry-After` when the response carries one. An OpenRouter `429` after those
-retries still arrives as `rate_limit`.
+against the question (`malformed_response`, retryable, nothing to act on). Both routes are retried before an error surfaces here, with the same policy: HTTP
+408, 429 and the whole 500-599 range, plus connection errors and per-attempt
+timeouts, for three attempts total. Backoff is 500ms doubling to a 5s cap with 25%
+jitter, and a provider-requested delay (`retry-after-ms`, then `Retry-After` as
+seconds or an HTTP date) is honoured up to 60 seconds. The TypeSafe SDK implements
+this on its path and the OpenRouter client mirrors it, so the same question has the
+same failure profile whichever route answers. An exhausted balance is its own kind,
+`insufficient_credits` (HTTP 402), on both routes, and is never retried.
 
 Every judgment result also carries `latency_ms` for the API round trip and the
 `provider` that served it, so calibration notes can record cost alongside confidence.
@@ -252,10 +257,12 @@ a round trip:
 | Rate | 250k tokens/s and 1,200 requests/min on the TypeSafe API |
 
 `JEV_MAX_QUESTIONS` (default 64) and `JEV_MAX_STATE_CHARS` (default 150,000) are local
-caps that bound one call's cost, sitting just under the API's own budget. Oversized
-state is rejected rather than truncated, because truncating silently changes the
-material the judgment rests on. Raise either if your workload packs tighter than
-English prose; the API remains the final arbiter.
+caps that bound one call's cost, sitting just under the API's own budget. The size cap
+counts the request text the model actually receives — **the state plus every
+question**, since the two share the budget — so a huge instruction cannot slip past it.
+Oversized requests are rejected rather than truncated, because truncating silently
+changes the material the judgment rests on. Raise either if your text packs tighter
+than English prose; the API remains the final arbiter.
 
 Past 255 options, search in two passes: one question picks a window, a second ranks
 within it.
@@ -271,8 +278,9 @@ under 150,000 characters can still exhaust the budget.
 
 Two guards, in order:
 
-1. The server rejects a state beyond `JEV_MAX_STATE_CHARS` **before** any request goes
-   out, and the error names the estimate in tokens and asks for a filtered state.
+1. The server rejects request text beyond `JEV_MAX_STATE_CHARS` **before** any request
+   goes out — counting the state and the questions together — and the error names both
+   parts, so a caller learns the split rather than just that it was too long.
 2. The API is the final arbiter. A genuine overflow returns `400
    max_tokens_exceeded`, never a credit or server error.
 
@@ -313,7 +321,7 @@ Point your client at the directory, or copy the file to `~/.claude/skills/jev/`.
 | `OPENROUTER_BASE_URL` | Overrides `https://openrouter.ai`. Mainly for tests or a proxy. |
 | `JEV_TIMEOUT_MS` | Per-attempt timeout. Defaults to 15000. |
 | `JEV_MAX_QUESTIONS` | Questions per `jev_ask`. Defaults to 64. |
-| `JEV_MAX_STATE_CHARS` | Largest state accepted. Defaults to 150000, about 32k tokens of English. |
+| `JEV_MAX_STATE_CHARS` | Largest request text accepted, counting the state plus every question. Defaults to 150000, about 32k tokens of English. |
 | `TYPESAFE_LOG_LEVEL` | SDK verbosity on the TypeSafe path. Safe at any level; all output goes to stderr. |
 
 An unusable value for any numeric setting falls back to the default and warns on
@@ -342,6 +350,11 @@ balance is shared with other models, give Jev its own TypeSafe key instead
 Jev's ~32k-token budget, which a character count cannot always predict. Filter the
 state in code; do not raise `JEV_MAX_STATE_CHARS` for this, since the API rejects it
 anyway.
+
+**A numeric setting seems ignored.** A fractional or zero value (`JEV_TIMEOUT_MS=0.5`)
+is not a smaller limit: it falls back to the default and warns on stderr, because 0.5
+used to floor to 0 and silently disable the cap it was meant to tighten. Check the
+server's stderr for the warning.
 
 **A 400 naming too many score levels.** A Score question takes at most 10 levels. The
 server rejects that locally, so a 400 here means the level count came through some

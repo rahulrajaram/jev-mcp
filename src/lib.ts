@@ -80,10 +80,13 @@ export interface ParsedNumber {
 export function readPositiveInt(raw: string | undefined, fallback: number, label: string): ParsedNumber {
   if (raw === undefined || raw.trim() === "") return { value: fallback };
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return { value: fallback, warning: `${label} must be a positive number; got ${JSON.stringify(raw)}. Using ${fallback}.` };
+  // A fractional value is not a smaller limit, it is a different one: 0.5 used
+  // to floor to 0 and silently disable the cap it was meant to tighten (a 0ms
+  // timeout aborts every call). Only a whole number of at least 1 is usable.
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return { value: fallback, warning: `${label} must be a whole number of at least 1; got ${JSON.stringify(raw)}. Using ${fallback}.` };
   }
-  return { value: Math.floor(parsed) };
+  return { value: parsed };
 }
 
 // ── Choice option handling ──────────────────────────────────────────────────
@@ -147,7 +150,19 @@ export function buildChoiceCriteria(
   return { criteria, noneKey };
 }
 
-/** Reject duplicate question ids rather than letting a later one shadow an earlier one. */
+/**
+ * Reject duplicate or unusable question ids rather than letting one vanish.
+ *
+ * Duplicates are refused because answers are keyed by id, so a repeat would
+ * silently drop every earlier question sharing it.
+ *
+ * `__proto__` is refused because it is not an ordinary key anywhere in the
+ * path: assigning it to a plain object sets the prototype instead of creating a
+ * property, and zod's record parsing drops it even from a null-prototype input
+ * (verified). The question would leave the request, or the answer would leave
+ * the response, without an error. Refusing it keeps the promise that nothing is
+ * silently dropped.
+ */
 export function assertUniqueIds(ids: readonly string[]): void {
   const seen = new Set<string>();
   const duplicates = new Set<string>();
@@ -161,6 +176,11 @@ export function assertUniqueIds(ids: readonly string[]): void {
         "Answers are keyed by id, so a repeat would silently drop every earlier question sharing it.",
     );
   }
+  if (seen.has("__proto__")) {
+    throw new Error(
+      'Question id "__proto__" is not usable: it is not an ordinary key in JavaScript objects or in the answer schema, so the question or its answer would be dropped without an error. Use a different id.',
+    );
+  }
 }
 
 // ── Size guards ─────────────────────────────────────────────────────────────
@@ -171,18 +191,31 @@ export function stateSize(state: unknown): number {
 }
 
 /**
- * Reject oversized state instead of truncating it.
+ * Text the request will send: the state plus every question.
+ *
+ * Both share one budget, so measuring the state alone would let an unbounded
+ * instruction escape the documented per-call bound.
+ */
+export function requestSize(state: unknown, questions?: unknown): number {
+  return stateSize(state) + (questions === undefined ? 0 : stateSize(questions));
+}
+
+/**
+ * Reject an oversized request instead of truncating it.
  *
  * Truncation silently changes the material the judgment rests on, which turns a
  * size problem into a wrong answer. Failing loudly keeps the caller in control.
+ * The state and the questions share Jev's ~32k-token budget, so both count.
  */
-export function assertStateWithinLimit(state: unknown, maxChars: number): void {
-  const size = stateSize(state);
-  if (size > maxChars) {
+export function assertRequestWithinLimit(state: unknown, questions: unknown, maxChars: number): void {
+  const stateChars = stateSize(state);
+  const questionChars = questions === undefined ? 0 : stateSize(questions);
+  const total = stateChars + questionChars;
+  if (total > maxChars) {
     throw new Error(
-      `State is ${size} characters (~${Math.round(size / 4)} tokens of English), above the ${maxChars} limit. ` +
-        "Jev's request budget is about 32,000 tokens shared by the state and every question, so filter in code first and send only the fields the questions need: the paragraph, the diff hunk, the record — not the whole file, log, or transcript. " +
-        "Raise JEV_MAX_STATE_CHARS only if your state packs tighter than English prose; the API rejects a genuine overflow with max_tokens_exceeded either way.",
+      `Request text is ${total} characters (state ${stateChars} + questions ${questionChars}), above the ${maxChars} limit. ` +
+        "Jev's request budget is about 32,000 tokens shared by the state and every question, so filter in code first: send the paragraph, the diff hunk, the record — not the whole file, log, or transcript — and ask only the questions you need. " +
+        "Raise JEV_MAX_STATE_CHARS only if your text packs tighter than English prose; the API rejects a genuine overflow with max_tokens_exceeded either way.",
     );
   }
 }
@@ -264,20 +297,44 @@ function autoProvider(typesafeKeyPresent: boolean, openrouterKeyPresent: boolean
 // ── Retry helpers (pure, so the policy is unit-testable) ─────────────────────
 
 /**
- * Parse a Retry-After header carrying seconds. Capped at 30s so a header from
- * a throttling provider cannot stall an MCP call indefinitely; negative,
- * fractional, or date-form values fall back to exponential backoff.
+ * Parse the delay a provider asks for, mirroring the TypeSafe SDK's policy:
+ * `retry-after-ms` wins, then `Retry-After` as seconds, then as an HTTP date.
+ * A delay above the cap is ignored rather than obeyed, so a header cannot stall
+ * an MCP call; the caller falls back to exponential backoff.
  */
-export function parseRetryAfterSeconds(value: string | null | undefined): number | null {
-  if (value === null || value === undefined) return null;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) return null;
-  return Math.min(30, Math.floor(parsed));
+export const MAX_RETRY_AFTER_MS = 60_000;
+
+export function parseRetryAfterMs(
+  retryAfterMs: string | null | undefined,
+  retryAfter: string | null | undefined,
+  nowMs = 0,
+): number | null {
+  if (retryAfterMs !== null && retryAfterMs !== undefined && retryAfterMs.trim() !== "") {
+    const ms = Number(retryAfterMs);
+    if (Number.isFinite(ms) && ms >= 0) return ms <= MAX_RETRY_AFTER_MS ? ms : null;
+  }
+  if (retryAfter === null || retryAfter === undefined || retryAfter.trim() === "") return null;
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds)) {
+    if (seconds < 0) return null;
+    const total = seconds * 1000;
+    return total <= MAX_RETRY_AFTER_MS ? total : null;
+  }
+  const date = Date.parse(retryAfter);
+  if (Number.isNaN(date)) return null;
+  const delta = Math.max(0, date - nowMs);
+  return delta <= MAX_RETRY_AFTER_MS ? delta : null;
 }
 
-/** Delay before retry N (0-based): 500ms, 1s, 2s, … capped at 8s. */
-export function backoffDelayMs(attempt: number, baseMs = 500, capMs = 8_000): number {
-  return Math.min(capMs, baseMs * 2 ** attempt);
+/** The SDK's backoff shape, so both routes wait the same way. */
+export const BACKOFF_INITIAL_MS = 500;
+export const BACKOFF_MAX_MS = 5_000;
+export const BACKOFF_JITTER = 0.25;
+
+/** Delay before retry N (0-based): 500ms doubling to a 5s cap, with 25% jitter. */
+export function backoffDelayMs(attempt: number, random: () => number = Math.random): number {
+  const exponential = Math.min(BACKOFF_INITIAL_MS * 2 ** attempt, BACKOFF_MAX_MS);
+  return Math.round(exponential * (1 - random() * BACKOFF_JITTER));
 }
 
 // ── Errors raised by the OpenRouter provider ────────────────────────────────
@@ -346,6 +403,13 @@ export interface DescribedError {
 }
 
 /**
+ * What an exhausted balance means, shared by both routes so the same HTTP
+ * status yields the same kind and advice whichever API answered.
+ */
+const INSUFFICIENT_CREDITS_HINT =
+  "The provider account cannot afford this request, so retrying it unchanged will fail the same way. Add credits (openrouter.ai/settings/credits on the OpenRouter path) or send a smaller request. A full-budget Jev request costs well under a cent, so this usually means a shared account balance is exhausted rather than Jev being expensive.";
+
+/**
  * Classify a failure so a caller can branch on it.
  *
  * Flattening every failure to a string makes a missing key, a malformed
@@ -365,7 +429,7 @@ export function describeError(error: unknown): DescribedError {
         ...base,
         kind: "insufficient_credits",
         retryable: false,
-        hint: "The provider account cannot afford this request, so retrying it unchanged will fail the same way. Add credits (openrouter.ai/settings/credits on the OpenRouter path) or send a smaller state. A full-budget Jev request costs well under a cent, so this usually means a shared account balance is exhausted rather than Jev being expensive.",
+        hint: INSUFFICIENT_CREDITS_HINT,
       };
     }
     if (error.status === 403) {
@@ -421,6 +485,14 @@ export function describeError(error: unknown): DescribedError {
     const base = { message, status: error.status, requestId: error.requestId };
     if (error instanceof AuthenticationError) {
       return { ...base, kind: "authentication", retryable: false, hint: "The API key was rejected. Check TYPESAFE_API_KEY in the server's environment." };
+    }
+    if (error.status === 402) {
+      return {
+        ...base,
+        kind: "insufficient_credits",
+        retryable: false,
+        hint: INSUFFICIENT_CREDITS_HINT,
+      };
     }
     if (error instanceof PermissionDeniedError) {
       return { ...base, kind: "permission_denied", retryable: false, hint: "The key is valid but lacks access to this model or account." };
@@ -541,10 +613,17 @@ export function validateScoreAnswer(answer: unknown, levelCount: number, label: 
     throw new MalformedResponseError(`Answer '${label}' has no legend.`);
   }
   const legendKeys = Object.keys(a.legend as Record<string, unknown>);
-  if (legendKeys.length !== levelCount) {
-    throw new MalformedResponseError(`Answer '${label}' has a legend of ${legendKeys.length} levels; the question sent ${levelCount}.`);
+  // The levels were sent as positions 0..n-1, and the API keys the legend by
+  // those numbers. Checking only the count accepted a same-length legend with
+  // foreign keys, so a caller keying probabilities by level index could act on
+  // a rubric it never sent. The identity of the keys is the question here.
+  const expectedKeys = Array.from({ length: levelCount }, (_, i) => String(i));
+  if (!sameKeySet(legendKeys, expectedKeys)) {
+    throw new MalformedResponseError(
+      `Answer '${label}' has a legend for ${JSON.stringify(legendKeys)}, but the question sent ${levelCount} levels keyed ${JSON.stringify(expectedKeys)}.`,
+    );
   }
-  checkDistribution(a.probabilities, legendKeys, label);
+  checkDistribution(a.probabilities, expectedKeys, label);
 }
 
 /** Check a Noul answer: one finite probability in [0, 1]. */

@@ -79,8 +79,9 @@ repetitive, or code-like text costs more tokens per character. A measured probe 
 `"x "` repeated ran at about 2 characters per token, so a state can look safely under
 the cap and still exhaust the budget.
 
-This server rejects an oversized state before any request goes out, naming the token
-estimate, and the API rejects a genuine overflow with `max_tokens_exceeded`.
+This server rejects request text beyond the cap before any request goes out — the state
+and the questions share one budget — naming both parts in the error, and the API rejects
+a genuine overflow with `max_tokens_exceeded`.
 
 Filter in code first. Send the paragraph, the diff hunk, the fields the question needs
 — not the file, the log, or the transcript. When a decision depends on finding the

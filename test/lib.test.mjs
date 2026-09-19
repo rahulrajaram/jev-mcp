@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { APIError } from "@typesafe-ai/sdk";
 import {
-  assertStateWithinLimit,
+  assertRequestWithinLimit,
   assertUniqueIds,
   backoffDelayMs,
   buildChoiceCriteria,
@@ -14,7 +14,7 @@ import {
   MalformedResponseError,
   MAX_CHOICE_OPTIONS,
   MAX_SCORE_LEVELS,
-  parseRetryAfterSeconds,
+  parseRetryAfterMs,
   ProviderHttpError,
   ProviderNetworkError,
   ProviderTimeoutError,
@@ -31,7 +31,13 @@ test("readPositiveInt falls back loudly instead of yielding NaN", () => {
   assert.deepEqual(readPositiveInt(undefined, 15000, "T"), { value: 15000 });
   assert.deepEqual(readPositiveInt("  ", 15000, "T"), { value: 15000 });
   assert.equal(readPositiveInt("500", 15000, "T").value, 500);
-  assert.equal(readPositiveInt("12.7", 15000, "T").value, 12);
+  // 0.5 used to floor to 0 and silently disable the cap it tightened.
+  for (const fractional of ["12.7", "0.5", "0.9", "1.0001"]) {
+    const parsed = readPositiveInt(fractional, 15000, "T");
+    assert.equal(parsed.value, 15000, `${fractional} must fall back, not floor`);
+    assert.ok(parsed.warning, `${fractional} must warn`);
+  }
+  assert.equal(readPositiveInt("1", 15000, "T").value, 1);
 
   for (const bad of ["abc", "0", "-5", "NaN"]) {
     const parsed = readPositiveInt(bad, 15000, "T");
@@ -86,12 +92,16 @@ test("state size is measured, and oversized state is rejected not truncated", ()
   assert.equal(stateSize("abcde"), 5);
   assert.equal(stateSize({ a: 1 }), JSON.stringify({ a: 1 }).length);
 
-  assert.doesNotThrow(() => assertStateWithinLimit("abc", 10));
-  assert.throws(() => assertStateWithinLimit("a".repeat(20), 10), /above the 10 limit/);
+  assert.doesNotThrow(() => assertRequestWithinLimit("abc", { q: 1 }, 10));
+  assert.throws(() => assertRequestWithinLimit("a".repeat(20), { q: 1 }, 10), /above the 10 limit/);
   // The error must teach the budget, not just refuse: a caller that only sees
-  // "too long" will retry with the same oversized state.
-  assert.throws(() => assertStateWithinLimit("a".repeat(400), 100), /~100 tokens/);
-  assert.throws(() => assertStateWithinLimit("a".repeat(400), 100), /32,000 tokens shared by the state and every question/);
+  // "too long" will retry with the same oversized request.
+  assert.throws(() => assertRequestWithinLimit("a".repeat(400), { q: 1 }, 100), /state 400 \+ questions/);
+  assert.throws(() => assertRequestWithinLimit("a".repeat(400), { q: 1 }, 100), /32,000 tokens shared by the state and every question/);
+  // Questions count against the same budget: an unbounded instruction used to
+  // escape the documented per-call bound entirely.
+  assert.doesNotThrow(() => assertRequestWithinLimit("a".repeat(50), { q: "b".repeat(40) }, 100));
+  assert.throws(() => assertRequestWithinLimit("a".repeat(50), { q: "b".repeat(60) }, 100), /questions 60|state 50 \+ questions/);
 });
 
 test("gateConfidence maps confidence onto an action", () => {
@@ -177,7 +187,10 @@ test("validateChoiceAnswer rejects NaN, out-of-range, and missing values", () =>
 test("validateScoreAnswer checks the legend and distribution against the levels sent", () => {
   const good = { type: "score", score: 1.2, confidence: 0.7, legend: { 0: "low", 1: "mid", 2: "high" }, probabilities: { 0: 0.1, 1: 0.6, 2: 0.3 } };
   assert.doesNotThrow(() => validateScoreAnswer(good, 3, "r"));
-  assert.throws(() => validateScoreAnswer(good, 4, "r"), /legend of 3 levels/);
+  assert.throws(() => validateScoreAnswer(good, 4, "r"), /question sent 4 levels keyed/);
+  // Same length, foreign keys: the count check used to accept this.
+  const foreign = { ...good, legend: { 0: "low", 1: "mid", 9: "high" }, probabilities: { 0: 0.1, 1: 0.6, 9: 0.3 } };
+  assert.throws(() => validateScoreAnswer(foreign, 3, "r"), MalformedResponseError);
   assert.throws(() => validateScoreAnswer({ ...good, score: Infinity }, 3, "r"), /finite score/);
   assert.throws(() => validateScoreAnswer({ ...good, probabilities: { 0: 0.5, 1: 0.5 } }, 3, "r"), /offered/);
 });
@@ -221,22 +234,29 @@ test("resolveProvider auto-detects from the keys present, preferring TypeSafe", 
   assert.equal(resolveProvider(undefined, false, false).provider, "typesafe", "no keys: keep the familiar missing-key error");
 });
 
-test("parseRetryAfterSeconds accepts bounded seconds and rejects the rest", () => {
-  assert.equal(parseRetryAfterSeconds("5"), 5);
-  assert.equal(parseRetryAfterSeconds("0"), 0);
-  assert.equal(parseRetryAfterSeconds(null), null);
-  assert.equal(parseRetryAfterSeconds(undefined), null);
-  assert.equal(parseRetryAfterSeconds("soon"), null);
-  assert.equal(parseRetryAfterSeconds("-1"), null);
-  assert.equal(parseRetryAfterSeconds("2.9"), 2);
-  assert.equal(parseRetryAfterSeconds("120"), 30, "a header cannot stall an MCP call indefinitely");
+test("parseRetryAfterMs mirrors the SDK: milliseconds first, then seconds or a date, capped", () => {
+  assert.equal(parseRetryAfterMs("1500", null), 1500, "retry-after-ms wins");
+  assert.equal(parseRetryAfterMs(null, "5"), 5000, "seconds are converted");
+  assert.equal(parseRetryAfterMs(null, "0"), 0);
+  assert.equal(parseRetryAfterMs(null, null), null);
+  assert.equal(parseRetryAfterMs("", "  "), null);
+  assert.equal(parseRetryAfterMs(null, "soon"), null);
+  assert.equal(parseRetryAfterMs(null, "-1"), null);
+  assert.equal(parseRetryAfterMs("120000", null), null, "a delay over the cap is ignored, not obeyed");
+  assert.equal(parseRetryAfterMs(null, "120"), null, "120s exceeds the 60s cap");
+  const now = Date.parse("2026-09-18T12:00:00Z");
+  assert.equal(parseRetryAfterMs(null, "Fri, 18 Sep 2026 12:00:30 GMT", now), 30_000, "HTTP-date form");
+  assert.equal(parseRetryAfterMs(null, "Fri, 18 Sep 2026 12:00:00 GMT", now), 0);
 });
 
-test("backoffDelayMs grows exponentially and caps", () => {
-  assert.equal(backoffDelayMs(0), 500);
-  assert.equal(backoffDelayMs(1), 1000);
-  assert.equal(backoffDelayMs(2), 2000);
-  assert.equal(backoffDelayMs(5), 8000);
+test("backoffDelayMs grows exponentially to a 5s cap and applies 25% jitter", () => {
+  const noJitter = () => 0;
+  assert.equal(backoffDelayMs(0, noJitter), 500);
+  assert.equal(backoffDelayMs(1, noJitter), 1000);
+  assert.equal(backoffDelayMs(2, noJitter), 2000);
+  assert.equal(backoffDelayMs(5, noJitter), 5000, "capped like the SDK, not 8s");
+  // Full jitter shaves up to a quarter of the delay.
+  assert.equal(backoffDelayMs(0, () => 1), 375);
 });
 
 test("describeError classifies provider HTTP errors a caller can branch on", () => {

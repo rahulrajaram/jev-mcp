@@ -127,7 +127,7 @@ export async function startMock() {
  */
 export async function startMockOpenRouter() {
   const requests = [];
-  const state = { confidence: 0.9, noul: 0.5, badKey: false, failNext: null, answers: null };
+  const state = { confidence: 0.9, noul: 0.5, badKey: false, failNext: null, answers: null, delayNextMs: 0 };
 
   const server = createServer((req, res) => {
     let raw = "";
@@ -175,13 +175,23 @@ export async function startMockOpenRouter() {
 
       if (req.url?.includes("/api/alpha/decisions")) {
         if (failureResponse(state, json)) return;
-        json(200, {
-          model: "typesafe/jev-1.13-20260917",
-          answers: state.answers ?? makeAnswers(parsed, state),
-          usage: { input_tokens: 25, output_tokens: 4, cost: 1.05e-6 },
-          id: "gen-dec-test",
-          provider: "TypeSafe",
-        });
+        const reply = () =>
+          json(200, {
+            model: "typesafe/jev-1.13-20260917",
+            answers: state.answers ?? makeAnswers(parsed, state),
+            usage: { input_tokens: 25, output_tokens: 4, cost: 1.05e-6 },
+            id: "gen-dec-test",
+            provider: "TypeSafe",
+          });
+        // A one-shot delay lets a test force a per-attempt timeout on the first
+        // attempt and still let the retry succeed.
+        if (state.delayNextMs > 0) {
+          const delay = state.delayNextMs;
+          state.delayNextMs = 0;
+          setTimeout(reply, delay);
+          return;
+        }
+        reply();
         return;
       }
 

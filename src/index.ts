@@ -34,7 +34,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
-  assertStateWithinLimit,
+  assertRequestWithinLimit,
   assertUniqueIds,
   backoffDelayMs,
   buildChoiceCriteria,
@@ -48,7 +48,7 @@ import {
   MalformedResponseError,
   MAX_CHOICE_OPTIONS,
   MAX_SCORE_LEVELS,
-  parseRetryAfterSeconds,
+  parseRetryAfterMs,
   ProviderHttpError,
   ProviderNetworkError,
   ProviderTimeoutError,
@@ -240,9 +240,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Statuses worth another attempt; anything else fails fast. */
-const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504, 529]);
+/**
+ * Statuses worth another attempt. Mirrors the TypeSafe SDK exactly — 408, 429
+ * and the whole 500-599 range — so the same question has the same failure
+ * profile on either route.
+ */
 const MAX_ATTEMPTS = 3;
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
 
 /**
  * OpenRouter's Decisions API. The question and answer shapes are the ones the
@@ -268,8 +275,11 @@ class OpenRouterProvider implements JudgmentProvider {
   }
 
   /**
-   * One request with retries. A retriable failure consumes an attempt and
-   * waits for Retry-After when present, otherwise exponential backoff.
+   * One request with retries. A retriable failure consumes an attempt and waits
+   * for Retry-After when the provider asked for one, otherwise for capped
+   * exponential backoff. A per-attempt timeout is retried too: the SDK retries
+   * its own timeouts (`apiTimeoutError: true`), so not retrying here would give
+   * the same question a different failure profile on this route.
    */
   private async request(path: string, init: RequestInit & { signal?: AbortSignal }): Promise<Response> {
     for (let attempt = 1; ; attempt++) {
@@ -281,20 +291,22 @@ class OpenRouterProvider implements JudgmentProvider {
       } catch (error) {
         // A caller abort is not a failure; let describeError see it.
         if (error instanceof Error && (error.name === "AbortError" || init.signal?.aborted)) throw error;
-        if (error instanceof Error && error.name === "TimeoutError") {
-          throw new ProviderTimeoutError(`OpenRouter did not answer within ${timeout.value}ms.`);
-        }
-        if (attempt < MAX_ATTEMPTS && !init.signal?.aborted) {
+        const retriesLeft = attempt < MAX_ATTEMPTS && !init.signal?.aborted;
+        const timedOut = error instanceof Error && error.name === "TimeoutError";
+        if (retriesLeft) {
           await sleep(backoffDelayMs(attempt - 1));
           continue;
         }
+        if (timedOut) {
+          throw new ProviderTimeoutError(`OpenRouter did not answer within ${timeout.value}ms, after ${attempt} attempts.`);
+        }
         throw new ProviderNetworkError(`Could not reach ${OR_BASE_URL}: ${error instanceof Error ? error.message : String(error)}`);
       }
-      if (response.ok || !RETRYABLE_STATUSES.has(response.status) || attempt >= MAX_ATTEMPTS || init.signal?.aborted) {
+      if (response.ok || !isRetryableStatus(response.status) || attempt >= MAX_ATTEMPTS || init.signal?.aborted) {
         return response;
       }
-      const retryAfter = parseRetryAfterSeconds(response.headers.get("retry-after"));
-      await sleep(retryAfter !== null ? retryAfter * 1000 : backoffDelayMs(attempt - 1));
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after-ms"), response.headers.get("retry-after"));
+      await sleep(retryAfterMs ?? backoffDelayMs(attempt - 1));
     }
   }
 
@@ -376,7 +388,7 @@ class OpenRouterProvider implements JudgmentProvider {
       message,
       response.status,
       response.headers.get("x-or-request-id") ?? undefined,
-      parseRetryAfterSeconds(response.headers.get("retry-after")),
+      parseRetryAfterMs(response.headers.get("retry-after-ms"), response.headers.get("retry-after")),
     );
   }
 }
@@ -430,6 +442,23 @@ function fail(error: unknown) {
     isError: true,
     content: [{ type: "text" as const, text: JSON.stringify({ error: described }, null, 2) }],
   };
+}
+
+/**
+ * Reject a threshold pair whose bands are inverted.
+ *
+ * `act` is a stricter reading of the same confidence than `review`, so an
+ * act_above below review_above makes the review band unreachable while the
+ * response still reports both thresholds as if they applied. The check tool
+ * already guards its own pair; the selecting tools must too, or a caller
+ * silently receives verdicts produced with one band ignored.
+ */
+function assertGateOrder(actAbove: number, reviewAbove: number): void {
+  if (actAbove < reviewAbove) {
+    throw new Error(
+      `act_above (${actAbove}) must not be below review_above (${reviewAbove}): the review band would be unreachable. Raise act_above or lower review_above.`,
+    );
+  }
 }
 
 const server = new McpServer({ name: "jev", version: VERSION });
@@ -492,15 +521,18 @@ server.registerTool(
   },
   async ({ state, question, options, add_none, act_above, review_above }, extra) => {
     try {
-      assertStateWithinLimit(state, maxStateChars.value);
       const actAbove = act_above ?? 0.8;
       const reviewAbove = review_above ?? 0.5;
+      assertGateOrder(actAbove, reviewAbove);
       const { criteria, noneKey } = buildChoiceCriteria(options as Record<string, EntryType>, add_none !== false);
+
+      const questions = { classify: choice(question, criteria) };
+      assertRequestWithinLimit(state, questions, maxStateChars.value);
 
       const p = getProvider();
       const started = performance.now();
       const result = await p.systemOne(
-        { state, model: MODEL, questions: { classify: choice(question, criteria) } },
+        { state, model: MODEL, questions },
         { signal: extra.signal },
       );
       const latency_ms = Math.round(performance.now() - started);
@@ -559,18 +591,21 @@ server.registerTool(
   },
   async ({ state, question, levels, act_above, review_above }, extra) => {
     try {
-      assertStateWithinLimit(state, maxStateChars.value);
       if (levels.length > MAX_SCORE_LEVELS) {
         throw new Error(`levels must contain at most ${MAX_SCORE_LEVELS} entries; received ${levels.length}. A Score question accepts up to 10 levels; this is an API limit.`);
       }
       const actAbove = act_above ?? 0.8;
       const reviewAbove = review_above ?? 0.5;
+      assertGateOrder(actAbove, reviewAbove);
+
+      // zod already enforces two or more levels; the SDK types that as a tuple.
+      const questions = { rating: score(question, levels as unknown as ScoreCriteria) };
+      assertRequestWithinLimit(state, questions, maxStateChars.value);
 
       const p = getProvider();
       const started = performance.now();
       const result = await p.systemOne(
-        // zod already enforces two or more levels; the SDK types that as a tuple.
-        { state, model: MODEL, questions: { rating: score(question, levels as unknown as ScoreCriteria) } },
+        { state, model: MODEL, questions },
         { signal: extra.signal },
       );
       const latency_ms = Math.round(performance.now() - started);
@@ -624,7 +659,6 @@ server.registerTool(
   },
   async ({ state, question, yes_means, no_means, yes_at_or_above, no_at_or_below }, extra) => {
     try {
-      assertStateWithinLimit(state, maxStateChars.value);
       const yesAt = yes_at_or_above ?? 0.7;
       const noAt = no_at_or_below ?? 0.3;
       if (noAt > yesAt) throw new Error("no_at_or_below must not exceed yes_at_or_above.");
@@ -634,10 +668,13 @@ server.registerTool(
           ? { true: yes_means ?? null, false: no_means ?? null }
           : undefined;
 
+      const questions = { check: criteria ? noul(question, criteria) : noul(question) };
+      assertRequestWithinLimit(state, questions, maxStateChars.value);
+
       const p = getProvider();
       const started = performance.now();
       const result = await p.systemOne(
-        { state, model: MODEL, questions: { check: criteria ? noul(question, criteria) : noul(question) } },
+        { state, model: MODEL, questions },
         { signal: extra.signal },
       );
       const latency_ms = Math.round(performance.now() - started);
@@ -701,18 +738,22 @@ server.registerTool(
   },
   async ({ state, questions, act_above, review_above }, extra) => {
     try {
-      assertStateWithinLimit(state, maxStateChars.value);
       if (questions.length > maxQuestions.value) {
         throw new Error(`questions must contain at most ${maxQuestions.value} entries; received ${questions.length}. Raise JEV_MAX_QUESTIONS if that limit is wrong for your workload.`);
       }
       assertUniqueIds(questions.map((q) => q.id));
       const actAbove = act_above ?? 0.8;
       const reviewAbove = review_above ?? 0.5;
+      assertGateOrder(actAbove, reviewAbove);
 
-      const built: Record<string, Question> = {};
-      const noneOptions: Record<string, string | null> = {};
+      // Null-prototype maps on purpose. A caller id of "__proto__" assigned to a
+      // plain object literal sets the prototype instead of creating a property,
+      // so the question vanished from the request and from the answer check
+      // without a word. On a null-prototype object every id is an ordinary key.
+      const built: Record<string, Question> = Object.create(null);
+      const noneOptions: Record<string, string | null> = Object.create(null);
       // What each answer must be checked against once it comes back.
-      const expected: Record<string, { type: "classify"; keys: string[] } | { type: "score"; levels: number } | { type: "check" }> = {};
+      const expected: Record<string, { type: "classify"; keys: string[] } | { type: "score"; levels: number } | { type: "check" }> = Object.create(null);
 
       for (const q of questions) {
         if (q.type === "classify") {
@@ -738,6 +779,8 @@ server.registerTool(
         }
       }
 
+      assertRequestWithinLimit(state, built, maxStateChars.value);
+
       const p = getProvider();
       const started = performance.now();
       const result = await p.systemOne({ state, model: MODEL, questions: built }, { signal: extra.signal });
@@ -746,17 +789,26 @@ server.registerTool(
       // Every question sent must come back well-formed. A missing answer is an
       // error, not a silently absent key, so a caller never acts on a partial set.
       const raw = result.answers as unknown as Record<string, Record<string, unknown>>;
-      const answers: Record<string, unknown> = {};
+      const answers: Record<string, unknown> = Object.create(null);
       for (const [id, want] of Object.entries(expected)) {
         const answer = raw[id];
         if (want.type === "classify") validateChoiceAnswer(answer, want.keys, id);
         else if (want.type === "score") validateScoreAnswer(answer, want.levels, id);
         else validateNoulAnswer(answer, id);
-        // Attach the confidence gate where there is a confidence to gate on.
+        // The validators have established the shape; narrow once here.
+        const a = answer as Record<string, unknown>;
+        // Attach the confidence gate where the primitive has a confidence to
+        // gate on, never because a stray numeric field happened to be present:
+        // a Noul has no confidence, so gating one would invent a meaning.
         answers[id] =
-          typeof answer?.confidence === "number"
-            ? { ...answer, action: gateConfidence(answer.confidence, actAbove, reviewAbove) }
-            : answer;
+          want.type === "check"
+            ? // A Noul has no confidence, so return only the validated pair
+              // rather than forwarding any stray field the provider added.
+              { type: "noul", noul: a.noul as number }
+            : {
+                ...a,
+                action: gateConfidence(typeof a.confidence === "number" ? a.confidence : undefined, actAbove, reviewAbove),
+              };
       }
 
       return ok({ answers, none_options: noneOptions, model: result.model, provider: p.name, usage: result.usage, latency_ms });
@@ -782,7 +834,7 @@ server.registerTool(
       provider: ProviderSchema,
       limits: z.object({
         context_tokens: z.number().describe("Jev's request budget in tokens, shared by the state and every question. Approximate: the real ratio depends on content."),
-        max_state_chars: z.number().describe("Largest state accepted, in characters (JEV_MAX_STATE_CHARS)."),
+        max_state_chars: z.number().describe("Largest request text accepted in characters, counting the state plus every question (JEV_MAX_STATE_CHARS)."),
         max_questions: z.number().describe("Questions allowed in one jev_ask call (JEV_MAX_QUESTIONS)."),
         max_choice_options: z.number().describe("Options allowed per Choice question."),
         max_score_levels: z.number().describe("Levels allowed per Score question."),

@@ -703,3 +703,180 @@ test("jev_models over OpenRouter proves the key and lists the Jev family", async
     await mock.close();
   }
 });
+
+// ── Findings from the jev-answer-fidelity and correctness reviews ────────────
+
+test("regression: a question id of __proto__ is refused, never silently dropped", async () => {
+  // Assigning "__proto__" to a plain object sets the prototype rather than a
+  // property, and zod's record parsing drops the key even from a null-prototype
+  // input, so the question or its answer would vanish with no error.
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      const result = await client.callTool({
+        name: "jev_ask",
+        arguments: { state: "s", questions: [{ id: "__proto__", type: "check", question: "A?" }] },
+      });
+      assert.equal(result.isError, true);
+      const { error } = payload(result);
+      assert.match(error.message, /__proto__/);
+      assert.match(error.message, /dropped without an error/);
+      assert.equal(mock.requests.length, 0, "the question must be refused before any request");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: an inverted act/review pair is refused instead of collapsing the review band", async () => {
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      for (const [tool, args] of [
+        ["jev_classify", { state: "s", question: "q", options: { a: "d", b: "d" } }],
+        ["jev_score", { state: "s", question: "q", levels: ["low", "high"] }],
+      ]) {
+        const result = await client.callTool({ name: tool, arguments: { ...args, act_above: 0.3, review_above: 0.8 } });
+        assert.equal(result.isError, true, `${tool} must refuse inverted thresholds`);
+        assert.match(payload(result).error.message, /review band would be unreachable/);
+      }
+      assert.equal(mock.requests.length, 0);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: the jev_ask question cap is enforced, not just advertised", async () => {
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url, env: { JEV_MAX_QUESTIONS: "2" } }, async (client) => {
+      const result = await client.callTool({
+        name: "jev_ask",
+        arguments: {
+          state: "s",
+          questions: [
+            { id: "a", type: "check", question: "A?" },
+            { id: "b", type: "check", question: "B?" },
+            { id: "c", type: "check", question: "C?" },
+          ],
+        },
+      });
+      assert.equal(result.isError, true);
+      assert.match(payload(result).error.message, /at most 2 entries/);
+      assert.equal(mock.requests.length, 0, "the bound must hold before a request is sent");
+
+      const limits = payload(await client.callTool({ name: "jev_models", arguments: {} }));
+      assert.equal(limits.limits.max_questions, 2, "the reported limit must be the effective one");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: an inverted check threshold pair is refused, not silently accepted", async () => {
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      const result = await client.callTool({
+        name: "jev_check",
+        arguments: { state: "s", question: "q", yes_at_or_above: 0.1, no_at_or_below: 0.9 },
+      });
+      assert.equal(result.isError, true);
+      assert.match(payload(result).error.message, /no_at_or_below must not exceed yes_at_or_above/);
+      assert.equal(mock.requests.length, 0);
+
+      const ordered = await client.callTool({
+        name: "jev_check",
+        arguments: { state: "s", question: "q", yes_at_or_above: 0.9, no_at_or_below: 0.1 },
+      });
+      assert.notEqual(ordered.isError, true, "well-ordered thresholds must still pass");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: question text counts against the same budget as the state", async () => {
+  // The state cap alone let an unbounded instruction escape the documented
+  // per-call bound, since the model sees state and questions together.
+  const mock = await startMock();
+  try {
+    await withClient({ baseUrl: mock.url, env: { JEV_MAX_STATE_CHARS: "500" } }, async (client) => {
+      const result = await client.callTool({
+        name: "jev_check",
+        arguments: { state: "small", question: "x".repeat(600) },
+      });
+      assert.equal(result.isError, true);
+      const message = payload(result).error.message;
+      assert.match(message, /Request text is .*state 5 \+ questions/);
+      assert.equal(mock.requests.length, 0);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: the OpenRouter route retries the whole 5xx range, as the SDK does", async () => {
+  const mock = await startMockOpenRouter();
+  mock.state.failNext = { status: 521, times: 1, retryAfter: 0 };
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.notEqual(result.isError, true, "521 must be retried");
+      assert.equal(mock.decisions().length, 2);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: the OpenRouter route retries a per-attempt timeout, as the SDK does", async () => {
+  const mock = await startMockOpenRouter();
+  mock.state.delayNextMs = 400;
+  try {
+    await withClient(
+      { withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url, JEV_TIMEOUT_MS: "120" } },
+      async (client) => {
+        const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+        assert.notEqual(result.isError, true, "the timeout on attempt one must be retried");
+        assert.equal(mock.decisions().length, 2);
+      },
+    );
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: an out-of-credits 402 is named on the TypeSafe route too", async () => {
+  const mock = await startMock();
+  mock.state.failNext = { status: 402, times: 10 };
+  try {
+    await withClient({ baseUrl: mock.url }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.equal(result.isError, true);
+      const { error } = payload(result);
+      assert.equal(error.kind, "insufficient_credits", "the same status must classify the same on both routes");
+      assert.equal(error.retryable, false);
+      assert.match(error.hint, /credit/i);
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("regression: the scope guide keeps its substance, not just its markers", async () => {
+  // The guide is the behavioural guard for the whole judgment surface, so a
+  // future edit that kept the markers while permitting arithmetic or one-off
+  // use must fail here.
+  await withClient({ withKey: false }, async (client) => {
+    const { tools } = await client.listTools();
+    for (const tool of tools.filter((t) => t.name !== "jev_models")) {
+      const description = (tool.description ?? "").toLowerCase();
+      for (const substance of ["arithmetic", "counting", "date", "one-off judgment", "sdk code", "deterministic"]) {
+        assert.ok(description.includes(substance), `${tool.name} must still exclude ${substance}`);
+      }
+      assert.ok(description.includes("calibrated probability"), `${tool.name} must state when it is wanted`);
+    }
+  });
+});
