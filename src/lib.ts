@@ -29,12 +29,27 @@ import type { EntryType } from "@typesafe-ai/sdk";
 export const MAX_CHOICE_OPTIONS = 255;
 
 /**
+ * A Score question accepts up to 10 levels. This is a documented API limit
+ * (docs.typesafe.ai/primitives/score, "up to 10"), confirmed on the wire: 11
+ * levels returns HTTP 400, "Too many score levels. Must have at most 10
+ * levels." Enforcing it locally keeps a request that the API would always
+ * reject from costing a round trip.
+ */
+export const MAX_SCORE_LEVELS = 10;
+
+/**
  * Local safety caps, not API limits. They bound cost and latency for a single
  * call so a malformed loop cannot run up a bill. All three are configurable.
+ *
+ * The state default tracks Jev's context budget: the request's tokens are
+ * shared between `state` and the questions, around 32,000 tokens — roughly
+ * 150,000 characters of English text (docs.typesafe.ai/primitives, "Ask
+ * multiple questions together"). A state past the budget fails at the API,
+ * so the local default sits just under it. The API remains the real enforcer;
+ * raise the cap only if your state packs tighter than English prose.
  */
-export const DEFAULT_MAX_SCORE_LEVELS = 255;
 export const DEFAULT_MAX_QUESTIONS = 64;
-export const DEFAULT_MAX_STATE_CHARS = 200_000;
+export const DEFAULT_MAX_STATE_CHARS = 150_000;
 export const DEFAULT_TIMEOUT_MS = 15_000;
 
 // ── Environment parsing ─────────────────────────────────────────────────────
@@ -193,6 +208,101 @@ export function gateProbability(probability: number, yesAtOrAbove: number, noAtO
   return "uncertain";
 }
 
+// ── Provider selection ─────────────────────────────────────────────────────
+
+export type ProviderName = "typesafe" | "openrouter";
+
+export interface ResolvedProvider {
+  provider: ProviderName;
+  /** Set when JEV_PROVIDER carried an unusable value and auto-detection was used. */
+  warning?: string;
+}
+
+/**
+ * Decide which API serves the tools.
+ *
+ * An explicit JEV_PROVIDER wins. Without one, prefer the TypeSafe API when any
+ * of its key sources exists (the SDK carries retries and request ids), then
+ * OpenRouter when its key exists, and otherwise default to TypeSafe so a
+ * missing key produces the familiar error. An unusable explicit value warns
+ * and falls through to the same order rather than guessing a provider silently.
+ */
+export function resolveProvider(
+  explicit: string | undefined,
+  typesafeKeyPresent: boolean,
+  openrouterKeyPresent: boolean,
+): ResolvedProvider {
+  if (explicit !== undefined && explicit.trim() !== "") {
+    const value = explicit.trim().toLowerCase();
+    if (value === "typesafe" || value === "openrouter") return { provider: value };
+    return {
+      provider: autoProvider(typesafeKeyPresent, openrouterKeyPresent),
+      warning: `JEV_PROVIDER must be "typesafe" or "openrouter"; got ${JSON.stringify(explicit)}. Using auto-detection.`,
+    };
+  }
+  return { provider: autoProvider(typesafeKeyPresent, openrouterKeyPresent) };
+}
+
+function autoProvider(typesafeKeyPresent: boolean, openrouterKeyPresent: boolean): ProviderName {
+  if (typesafeKeyPresent) return "typesafe";
+  if (openrouterKeyPresent) return "openrouter";
+  return "typesafe";
+}
+
+// ── Retry helpers (pure, so the policy is unit-testable) ─────────────────────
+
+/**
+ * Parse a Retry-After header carrying seconds. Capped at 30s so a header from
+ * a throttling provider cannot stall an MCP call indefinitely; negative,
+ * fractional, or date-form values fall back to exponential backoff.
+ */
+export function parseRetryAfterSeconds(value: string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.min(30, Math.floor(parsed));
+}
+
+/** Delay before retry N (0-based): 500ms, 1s, 2s, … capped at 8s. */
+export function backoffDelayMs(attempt: number, baseMs = 500, capMs = 8_000): number {
+  return Math.min(capMs, baseMs * 2 ** attempt);
+}
+
+// ── Errors raised by the OpenRouter provider ────────────────────────────────
+
+/**
+ * An HTTP failure from the OpenRouter API, carrying what describeError needs.
+ * The body's `error.message` is extracted when present, since that is where
+ * OpenRouter nests the provider's own validation detail.
+ */
+export class ProviderHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly requestId?: string,
+    readonly retryAfterSeconds?: number | null,
+  ) {
+    super(message);
+    this.name = "ProviderHttpError";
+  }
+}
+
+/** The per-attempt timeout (AbortSignal.timeout) fired before a response. */
+export class ProviderTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProviderTimeoutError";
+  }
+}
+
+/** fetch failed before a response arrived: DNS, connection, TLS. */
+export class ProviderNetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProviderNetworkError";
+  }
+}
+
 // ── Error reporting ─────────────────────────────────────────────────────────
 
 export type ErrorKind =
@@ -232,6 +342,37 @@ export interface DescribedError {
 export function describeError(error: unknown): DescribedError {
   const message = error instanceof Error ? error.message : String(error);
 
+  if (error instanceof ProviderHttpError) {
+    const base = { message, status: error.status, requestId: error.requestId };
+    if (error.status === 401) {
+      return { ...base, kind: "authentication", retryable: false, hint: "The API key was rejected. Check the key for the active provider (TYPESAFE_API_KEY or OPENROUTER_API_KEY) in the server's environment." };
+    }
+    if (error.status === 403) {
+      return { ...base, kind: "permission_denied", retryable: false, hint: "The key is valid but lacks access to this model or account." };
+    }
+    if (error.status === 404) {
+      return { ...base, kind: "not_found", retryable: false, hint: "Check the model id in JEV_MODEL. On OpenRouter the Jev ids are typesafe/jev-1.13 and the ~typesafe/jev-latest alias." };
+    }
+    if (error.status === 408) {
+      return { ...base, kind: "timeout", retryable: true, hint: "The provider reported a request timeout. Retry, shorten the state, or raise JEV_TIMEOUT_MS." };
+    }
+    if (error.status === 429) {
+      return { ...base, kind: "rate_limit", retryable: true, hint: "Rate limited after this server's own retries. Back off before trying again." };
+    }
+    if (error.status === 400 || error.status === 422) {
+      return { ...base, kind: "invalid_request", retryable: false, hint: "The request failed validation. The message names the offending field." };
+    }
+    return { ...base, kind: "server_error", retryable: error.status >= 500, hint: "The provider returned an error. Retry if it persists." };
+  }
+  if (error instanceof ProviderTimeoutError) {
+    return { kind: "timeout", message, retryable: true, hint: "Shorten the state or raise JEV_TIMEOUT_MS." };
+  }
+  if (error instanceof ProviderNetworkError) {
+    return { kind: "connection", message, retryable: true, hint: "Check network access to openrouter.ai." };
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return { kind: "cancelled", message, retryable: false, hint: "The client cancelled the request." };
+  }
   if (error instanceof MalformedResponseError) {
     return {
       kind: "malformed_response",
@@ -280,7 +421,7 @@ export function describeError(error: unknown): DescribedError {
       kind: "no_api_key",
       message,
       retryable: false,
-      hint: "Set TYPESAFE_API_KEY in the environment of the MCP client, not as a tool argument. Many clients filter the environment, so pass it explicitly when registering the server.",
+      hint: "Set the key for the active provider (TYPESAFE_API_KEY, or OPENROUTER_API_KEY when JEV_PROVIDER=openrouter) in the environment of the MCP client, not as a tool argument. Many clients filter the environment, so a key file or an explicit env entry when registering the server is more reliable.",
     };
   }
 

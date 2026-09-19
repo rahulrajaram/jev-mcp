@@ -1,16 +1,16 @@
 {
   "name": "jev-mcp",
-  "version": "0.4.0",
-  "description": "MCP server exposing TypeSafe Jev typed judgments: classify, score, check, a batched multi-question ask, and model discovery.",
+  "version": "0.5.0",
+  "description": "MCP server exposing TypeSafe Jev typed judgments — classify, score, check, a batched multi-question ask, and model discovery — over the TypeSafe API or OpenRouter. Fork of rashedint32/jev-mcp 0.4.0 adding the OpenRouter path and corrected limits.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rashedInt32/jev-mcp.git"
+    "url": "git+https://github.com/rahulrajaram/jev-mcp.git"
   },
-  "homepage": "https://github.com/rashedInt32/jev-mcp#readme",
+  "homepage": "https://github.com/rahulrajaram/jev-mcp#readme",
   "bugs": {
-    "url": "https://github.com/rashedInt32/jev-mcp/issues"
+    "url": "https://github.com/rahulrajaram/jev-mcp/issues"
   },
   "bin": {
     "jev-mcp": "./dist/index.js"
@@ -27,6 +27,7 @@
     "typesafe",
     "jev",
     "system-one",
+    "openrouter",
     "classification",
     "confidence",
     "ai"

@@ -6,14 +6,21 @@ import { APIError } from "@typesafe-ai/sdk";
 import {
   assertStateWithinLimit,
   assertUniqueIds,
+  backoffDelayMs,
   buildChoiceCriteria,
   describeError,
   gateConfidence,
   gateProbability,
   MalformedResponseError,
   MAX_CHOICE_OPTIONS,
+  MAX_SCORE_LEVELS,
+  parseRetryAfterSeconds,
+  ProviderHttpError,
+  ProviderNetworkError,
+  ProviderTimeoutError,
   readPositiveInt,
   resolveNoneKey,
+  resolveProvider,
   stateSize,
   validateChoiceAnswer,
   validateNoulAnswer,
@@ -183,4 +190,80 @@ test("describeError classifies a malformed response as retryable and never actio
   assert.equal(described.kind, "malformed_response");
   assert.equal(described.retryable, true);
   assert.match(described.hint, /should be acted on/i);
+});
+
+// ── Provider selection and retries ─────────────────────────────────────
+
+test("the score level cap matches the API limit, not a local guess", () => {
+  // Wire-confirmed: 11 levels returns 400 "Too many score levels. Must have
+  // at most 10 levels." Enforcing the real limit saves the round trip.
+  assert.equal(MAX_SCORE_LEVELS, 10);
+});
+
+test("resolveProvider honours an explicit choice and warns on an unusable one", () => {
+  assert.deepEqual(resolveProvider("typesafe", true, true), { provider: "typesafe" });
+  assert.deepEqual(resolveProvider("  OpenRouter ", false, false), { provider: "openrouter" });
+
+  const warned = resolveProvider("nonsense", true, false);
+  assert.equal(warned.provider, "typesafe", "an unusable value falls back to auto-detection");
+  assert.match(warned.warning, /JEV_PROVIDER/);
+});
+
+test("resolveProvider auto-detects from the keys present, preferring TypeSafe", () => {
+  assert.equal(resolveProvider(undefined, true, true).provider, "typesafe", "both keys: the SDK path wins");
+  assert.equal(resolveProvider(undefined, true, false).provider, "typesafe");
+  assert.equal(resolveProvider(undefined, false, true).provider, "openrouter");
+  assert.equal(resolveProvider("", false, true).provider, "openrouter", "whitespace is treated as unset");
+  assert.equal(resolveProvider(undefined, false, false).provider, "typesafe", "no keys: keep the familiar missing-key error");
+});
+
+test("parseRetryAfterSeconds accepts bounded seconds and rejects the rest", () => {
+  assert.equal(parseRetryAfterSeconds("5"), 5);
+  assert.equal(parseRetryAfterSeconds("0"), 0);
+  assert.equal(parseRetryAfterSeconds(null), null);
+  assert.equal(parseRetryAfterSeconds(undefined), null);
+  assert.equal(parseRetryAfterSeconds("soon"), null);
+  assert.equal(parseRetryAfterSeconds("-1"), null);
+  assert.equal(parseRetryAfterSeconds("2.9"), 2);
+  assert.equal(parseRetryAfterSeconds("120"), 30, "a header cannot stall an MCP call indefinitely");
+});
+
+test("backoffDelayMs grows exponentially and caps", () => {
+  assert.equal(backoffDelayMs(0), 500);
+  assert.equal(backoffDelayMs(1), 1000);
+  assert.equal(backoffDelayMs(2), 2000);
+  assert.equal(backoffDelayMs(5), 8000);
+});
+
+test("describeError classifies provider HTTP errors a caller can branch on", () => {
+  const cases = [
+    [401, "authentication", false],
+    [403, "permission_denied", false],
+    [404, "not_found", false],
+    [408, "timeout", true],
+    [429, "rate_limit", true],
+    [400, "invalid_request", false],
+    [422, "invalid_request", false],
+    [500, "server_error", true],
+    [529, "server_error", true],
+  ];
+  for (const [status, kind, retryable] of cases) {
+    const described = describeError(new ProviderHttpError(`HTTP ${status}`, status, "req_or_1"));
+    assert.equal(described.kind, kind, `${status} should map to ${kind}`);
+    assert.equal(described.retryable, retryable, `${status} retryable should be ${retryable}`);
+    assert.equal(described.status, status);
+    assert.equal(described.requestId, "req_or_1");
+  }
+});
+
+test("describeError maps provider transport failures to their kinds", () => {
+  assert.equal(describeError(new ProviderTimeoutError("slow")).kind, "timeout");
+  assert.equal(describeError(new ProviderTimeoutError("slow")).retryable, true);
+  assert.equal(describeError(new ProviderNetworkError("down")).kind, "connection");
+
+  const abort = new Error("This operation was aborted");
+  abort.name = "AbortError";
+  const cancelled = describeError(abort);
+  assert.equal(cancelled.kind, "cancelled");
+  assert.equal(cancelled.retryable, false);
 });

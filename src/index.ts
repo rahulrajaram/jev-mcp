@@ -18,6 +18,11 @@
  *  6. Every answer is checked against the question that was sent. A choice
  *     that was never offered, or a distribution that does not cover the
  *     offered options, is an error rather than a result.
+ *
+ * The same five tools are served by either of two APIs: TypeSafe's own (via
+ * @typesafe-ai/sdk) or OpenRouter's Decisions API, which routes to the same
+ * Jev models behind the same question schema. JEV_PROVIDER pins one;
+ * otherwise the server uses the API whose key it can find.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -31,34 +36,46 @@ import { join } from "node:path";
 import {
   assertStateWithinLimit,
   assertUniqueIds,
+  backoffDelayMs,
   buildChoiceCriteria,
   DEFAULT_MAX_QUESTIONS,
-  DEFAULT_MAX_SCORE_LEVELS,
   DEFAULT_MAX_STATE_CHARS,
   DEFAULT_TIMEOUT_MS,
   describeError,
   gateConfidence,
   gateProbability,
+  MalformedResponseError,
+  MAX_SCORE_LEVELS,
+  parseRetryAfterSeconds,
+  ProviderHttpError,
+  ProviderNetworkError,
+  ProviderTimeoutError,
   readPositiveInt,
+  resolveProvider,
   validateChoiceAnswer,
   validateNoulAnswer,
   validateScoreAnswer,
 } from "./lib.js";
 
-// Read from package.json so the advertised version cannot drift from the release.
-const VERSION: string = (() => {
+// Read from package.json so the advertised version and the OpenRouter
+// attribution cannot drift from the release. OpenRouter surfaces the title
+// and referer on its app rankings, so the server identifies itself on every
+// call.
+const { VERSION, APP_TITLE, HTTP_REFERER } = (() => {
+  const fallback = { version: "0.0.0", name: "jev-mcp", homepage: "https://github.com/rashedInt32/jev-mcp" };
   try {
-    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version?: unknown };
-    if (typeof pkg.version === "string" && pkg.version.length > 0) return pkg.version;
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as Partial<typeof fallback>;
+    return {
+      VERSION: typeof pkg.version === "string" && pkg.version ? pkg.version : fallback.version,
+      APP_TITLE: typeof pkg.name === "string" && pkg.name ? pkg.name : fallback.name,
+      HTTP_REFERER: typeof pkg.homepage === "string" && pkg.homepage ? pkg.homepage : fallback.homepage,
+    };
   } catch {
-    // fall through
+    return { VERSION: fallback.version, APP_TITLE: fallback.name, HTTP_REFERER: fallback.homepage };
   }
-  return "0.0.0";
 })();
 
 // ── Configuration ───────────────────────────────────────────────────────────
-
-const MODEL = process.env.JEV_MODEL ?? "jev-latest";
 
 /**
  * Every log line goes to stderr.
@@ -82,6 +99,43 @@ for (const setting of [timeout, maxQuestions, maxStateChars]) {
   if (setting.warning) console.error(`[jev-mcp] ${setting.warning}`);
 }
 
+// ── Provider and key resolution ─────────────────────────────────────────────
+
+/**
+ * Fallback source for the key.
+ *
+ * An MCP server is spawned with the client's own environment, not your shell's,
+ * so anything exported from `~/.zshenv` never arrives. Confirmed on the wire: a
+ * PreToolUse hook under the same client received `JEV_GUARD`, which is injected
+ * through settings `env`, but not `TYPESAFE_API_KEY`, which lives only in the
+ * shell profile.
+ *
+ * A 0600 file reaches every spawn path while keeping the secret out of
+ * `~/.claude.json`, out of argv, and out of any repository. Both providers get
+ * the same mechanism, because the env-stripping trap applies to either key.
+ */
+const KEY_FILE = process.env.JEV_KEY_FILE ?? join(homedir(), ".config", "typesafe", "key");
+const OR_KEY_FILE = process.env.JEV_OR_KEY_FILE ?? join(homedir(), ".config", "openrouter", "key");
+const OR_BASE_URL = (process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai").replace(/\/+$/, "");
+
+function readKeyFile(file: string): string | undefined {
+  try {
+    const contents = readFileSync(file, "utf8").trim();
+    return contents.length > 0 ? contents : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const typesafeKeyPresent = Boolean(process.env.TYPESAFE_API_KEY ?? process.env.JEV_API_KEY ?? readKeyFile(KEY_FILE));
+const openrouterKeyPresent = Boolean(process.env.OPENROUTER_API_KEY ?? readKeyFile(OR_KEY_FILE));
+const resolvedProvider = resolveProvider(process.env.JEV_PROVIDER, typesafeKeyPresent, openrouterKeyPresent);
+if (resolvedProvider.warning) console.error(`[jev-mcp] ${resolvedProvider.warning}`);
+const PROVIDER = resolvedProvider.provider;
+
+/** Model ids differ per provider, so the default tracks the active one. */
+const MODEL = process.env.JEV_MODEL ?? (PROVIDER === "openrouter" ? "~typesafe/jev-latest" : "jev-latest");
+
 // ── Shared schema pieces ────────────────────────────────────────────────────
 
 /**
@@ -102,9 +156,15 @@ const InstructionSchema = z
 /** Option and level descriptions accept the same JSON structure. */
 const DescriptionSchema = z.union([z.string(), z.record(z.any()), z.array(z.any()), z.null()]);
 
-const UsageSchema = z.object({ input_tokens: z.number(), output_tokens: z.number() });
+const UsageSchema = z.object({
+  input_tokens: z.number(),
+  output_tokens: z.number(),
+  cost: z.number().optional().describe("What the call cost in US dollars, when the provider reports it. OpenRouter does; the TypeSafe API bills by input token and reports no per-call cost."),
+});
 const LatencySchema = z.number().describe("Wall-clock milliseconds for the API round trip, for your own calibration logs.");
 const GateSchema = z.enum(["act", "review", "abstain"]);
+/** Which API served the answer; the shape is identical either way. */
+const ProviderSchema = z.enum(["typesafe", "openrouter"]);
 
 const ActAbove = z
   .number()
@@ -119,46 +179,229 @@ const ReviewAbove = z
   .optional()
   .describe("Confidence at or above which the answer is marked 'review' rather than 'abstain'. Default 0.5.");
 
-// ── Client ──────────────────────────────────────────────────────────────────
-
-let client: TypeSafeClient | undefined;
+// ── Providers ────────────────────────────────────────────────────────────────
 
 /**
- * Fallback source for the key.
+ * One judgment over a state, in the shape both providers accept and return.
  *
- * An MCP server is spawned with the client's own environment, not your shell's,
- * so anything exported from `~/.zshenv` never arrives. Confirmed on the wire: a
- * PreToolUse hook under the same client received `JEV_GUARD`, which is injected
- * through settings `env`, but not `TYPESAFE_API_KEY`, which lives only in the
- * shell profile.
- *
- * A 0600 file reaches every spawn path while keeping the secret out of
- * `~/.claude.json`, out of argv, and out of any repository.
+ * `answers` is `any` on purpose. Each entry is checked against the question
+ * that was sent (validateChoiceAnswer and friends) before any field is read,
+ * and the SDK's per-question generics cannot survive a provider-agnostic
+ * surface. The validation, not the type, is the safety net.
  */
-const KEY_FILE = process.env.JEV_KEY_FILE ?? join(homedir(), ".config", "typesafe", "key");
+interface JudgmentCall {
+  state: unknown;
+  model: string;
+  questions: Record<string, Question>;
+}
 
-function readKeyFile(): string | undefined {
-  try {
-    const contents = readFileSync(KEY_FILE, "utf8").trim();
-    return contents.length > 0 ? contents : undefined;
-  } catch {
-    return undefined;
+interface JudgmentResult {
+  model: string;
+  answers: Record<string, any>;
+  usage: { input_tokens: number; output_tokens: number; cost?: number };
+}
+
+interface JudgmentProvider {
+  readonly name: "typesafe" | "openrouter";
+  systemOne(call: JudgmentCall, options?: { signal?: AbortSignal }): Promise<JudgmentResult>;
+  listModels(options?: { signal?: AbortSignal }): Promise<{ name: string; description: string; release_date: string }[]>;
+}
+
+/** The TypeSafe API through the SDK: retries, request ids, models.list. */
+class TypeSafeProvider implements JudgmentProvider {
+  readonly name = "typesafe" as const;
+  private client: TypeSafeClient;
+
+  constructor(apiKey: string) {
+    this.client = new TypeSafeClient({ apiKey, timeout: timeout.value, logger: stderrLogger });
+  }
+
+  async systemOne({ state, model, questions }: JudgmentCall, { signal }: { signal?: AbortSignal } = {}): Promise<JudgmentResult> {
+    const result = await this.client.systemOne({ state: state as EntryType, model, questions }, { signal });
+    return {
+      model: result.model,
+      answers: result.answers as Record<string, any>,
+      usage: { input_tokens: result.usage.input_tokens, output_tokens: result.usage.output_tokens },
+    };
+  }
+
+  async listModels({ signal }: { signal?: AbortSignal } = {}) {
+    return this.client.models.list({ signal });
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Statuses worth another attempt; anything else fails fast. */
+const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504, 529]);
+const MAX_ATTEMPTS = 3;
+
 /**
- * Built lazily: the constructor throws without a key, and a missing key should
- * produce one clear tool error rather than stop the server from starting.
+ * OpenRouter's Decisions API. The question and answer shapes are the ones the
+ * TypeSafe API defines; OpenRouter routes them to the same Jev models under
+ * ids like typesafe/jev-1.13 and the ~typesafe/jev-latest alias, so a caller
+ * sees the same typed answers either way. This client reimplements what the
+ * TypeSafe SDK contributes on the other path: bounded retries that honour
+ * Retry-After, per-attempt timeouts, and errors that carry an HTTP status so
+ * callers can branch on them.
  */
-function getClient(): TypeSafeClient {
-  const apiKey = process.env.TYPESAFE_API_KEY ?? process.env.JEV_API_KEY ?? readKeyFile();
-  if (!apiKey) {
-    throw new Error(
-      `No API key. Set TYPESAFE_API_KEY in the environment of the MCP client, or create ${KEY_FILE} with mode 0600. Never pass it as a tool argument.`,
+class OpenRouterProvider implements JudgmentProvider {
+  readonly name = "openrouter" as const;
+
+  constructor(private apiKey: string) {}
+
+  private headers(): Record<string, string> {
+    return {
+      Authorization: `Bearer ${this.apiKey}`,
+      "Content-Type": "application/json",
+      "X-Title": APP_TITLE,
+      "HTTP-Referer": HTTP_REFERER,
+    };
+  }
+
+  /**
+   * One request with retries. A retriable failure consumes an attempt and
+   * waits for Retry-After when present, otherwise exponential backoff.
+   */
+  private async request(path: string, init: RequestInit & { signal?: AbortSignal }): Promise<Response> {
+    for (let attempt = 1; ; attempt++) {
+      const timeoutSignal = AbortSignal.timeout(timeout.value);
+      const signal = init.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+      let response: Response;
+      try {
+        response = await fetch(`${OR_BASE_URL}${path}`, { ...init, signal });
+      } catch (error) {
+        // A caller abort is not a failure; let describeError see it.
+        if (error instanceof Error && (error.name === "AbortError" || init.signal?.aborted)) throw error;
+        if (error instanceof Error && error.name === "TimeoutError") {
+          throw new ProviderTimeoutError(`OpenRouter did not answer within ${timeout.value}ms.`);
+        }
+        if (attempt < MAX_ATTEMPTS && !init.signal?.aborted) {
+          await sleep(backoffDelayMs(attempt - 1));
+          continue;
+        }
+        throw new ProviderNetworkError(`Could not reach ${OR_BASE_URL}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (response.ok || !RETRYABLE_STATUSES.has(response.status) || attempt >= MAX_ATTEMPTS || init.signal?.aborted) {
+        return response;
+      }
+      const retryAfter = parseRetryAfterSeconds(response.headers.get("retry-after"));
+      await sleep(retryAfter !== null ? retryAfter * 1000 : backoffDelayMs(attempt - 1));
+    }
+  }
+
+  async systemOne({ state, model, questions }: JudgmentCall, { signal }: { signal?: AbortSignal } = {}): Promise<JudgmentResult> {
+    const response = await this.request("/api/alpha/decisions", {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ model, questions, state }),
+      signal,
+    });
+    if (!response.ok) throw await this.httpError(response);
+
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch (error) {
+      throw new MalformedResponseError(`OpenRouter returned HTTP ${response.status} with a body that is not JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const parsed = body as { model?: unknown; answers?: unknown; usage?: { input_tokens?: unknown; output_tokens?: unknown; cost?: unknown } };
+    if (typeof parsed.answers !== "object" || parsed.answers === null || Array.isArray(parsed.answers)) {
+      throw new MalformedResponseError("OpenRouter returned no answers object.");
+    }
+    if (typeof parsed.model !== "string") throw new MalformedResponseError("OpenRouter returned no model id.");
+    if (typeof parsed.usage?.input_tokens !== "number" || typeof parsed.usage?.output_tokens !== "number") {
+      throw new MalformedResponseError("OpenRouter returned no token usage.");
+    }
+    const cost = typeof parsed.usage.cost === "number" ? parsed.usage.cost : undefined;
+    return {
+      model: parsed.model,
+      answers: parsed.answers as Record<string, any>,
+      usage: { input_tokens: parsed.usage.input_tokens, output_tokens: parsed.usage.output_tokens, cost },
+    };
+  }
+
+  async listModels({ signal }: { signal?: AbortSignal } = {}) {
+    // A cheap authenticated call proves the key before anything is listed,
+    // because the catalog reads below succeed without one.
+    const authCheck = await this.request("/api/v1/auth/key", { method: "GET", headers: this.headers(), signal });
+    if (!authCheck.ok) throw await this.httpError(authCheck);
+
+    // OpenRouter's models list does not include decisions models, so the Jev
+    // family is enumerated from its known catalog entries. A miss here means
+    // the family moved on; the active model in JEV_MODEL is unaffected.
+    const slugs = ["~typesafe/jev-latest", "typesafe/jev-1.13"];
+    const models: { name: string; description: string; release_date: string }[] = [];
+    for (const slug of slugs) {
+      const path = `/api/v1/models/${slug.split("/").map(encodeURIComponent).join("/")}/endpoints`;
+      const response = await this.request(path, { method: "GET", headers: this.headers(), signal });
+      if (!response.ok) continue;
+      const body = (await response.json()) as { data?: { id?: unknown; description?: unknown; created?: unknown } };
+      const data = body.data;
+      if (typeof data?.id !== "string" || typeof data.description !== "string" || typeof data.created !== "number") continue;
+      models.push({
+        name: data.id,
+        description: data.description,
+        release_date: new Date(data.created * 1000).toISOString().slice(0, 10),
+      });
+    }
+    if (models.length === 0) {
+      throw new ProviderHttpError("No Jev models were found in the OpenRouter catalog.", 404);
+    }
+    return models;
+  }
+
+  /**
+   * Build the typed error describeError can classify, extracting OpenRouter's
+   * nested detail: its error bodies are {error: {message, code}}.
+   */
+  private async httpError(response: Response): Promise<ProviderHttpError> {
+    const text = await response.text().catch(() => "");
+    let message = text.length > 0 ? text.slice(0, 500) : `HTTP ${response.status}`;
+    try {
+      const parsed = JSON.parse(text) as { error?: { message?: unknown } };
+      if (typeof parsed.error?.message === "string") message = parsed.error.message;
+    } catch {
+      // keep the raw text
+    }
+    return new ProviderHttpError(
+      message,
+      response.status,
+      response.headers.get("x-or-request-id") ?? undefined,
+      parseRetryAfterSeconds(response.headers.get("retry-after")),
     );
   }
-  client ??= new TypeSafeClient({ apiKey, timeout: timeout.value, logger: stderrLogger });
-  return client;
+}
+
+let provider: JudgmentProvider | undefined;
+
+/**
+ * Built lazily: a missing key should produce one clear tool error rather than
+ * stop the server from starting. The message names the key sources of the
+ * active provider, since that is the credential the operator must supply.
+ */
+function getProvider(): JudgmentProvider {
+  if (provider) return provider;
+  if (PROVIDER === "openrouter") {
+    const apiKey = process.env.OPENROUTER_API_KEY ?? readKeyFile(OR_KEY_FILE);
+    if (!apiKey) {
+      throw new Error(
+        `No API key. Set OPENROUTER_API_KEY in the environment of the MCP client, or create ${OR_KEY_FILE} with mode 0600. Never pass it as a tool argument.`,
+      );
+    }
+    provider = new OpenRouterProvider(apiKey);
+  } else {
+    const apiKey = process.env.TYPESAFE_API_KEY ?? process.env.JEV_API_KEY ?? readKeyFile(KEY_FILE);
+    if (!apiKey) {
+      throw new Error(
+        `No API key. Set TYPESAFE_API_KEY in the environment of the MCP client, or create ${KEY_FILE} with mode 0600. Never pass it as a tool argument.`,
+      );
+    }
+    provider = new TypeSafeProvider(apiKey);
+  }
+  return provider;
 }
 
 // ── Result helpers ──────────────────────────────────────────────────────────
@@ -215,6 +458,7 @@ server.registerTool(
       action: GateSchema,
       thresholds: z.object({ act_above: z.number(), review_above: z.number() }),
       model: z.string(),
+      provider: ProviderSchema,
       usage: UsageSchema,
       latency_ms: LatencySchema,
     },
@@ -226,8 +470,9 @@ server.registerTool(
       const reviewAbove = review_above ?? 0.5;
       const { criteria, noneKey } = buildChoiceCriteria(options as Record<string, EntryType>, add_none !== false);
 
+      const p = getProvider();
       const started = performance.now();
-      const result = await getClient().systemOne(
+      const result = await p.systemOne(
         { state, model: MODEL, questions: { classify: choice(question, criteria) } },
         { signal: extra.signal },
       );
@@ -242,6 +487,7 @@ server.registerTool(
         action: gateConfidence(answer.confidence, actAbove, reviewAbove),
         thresholds: { act_above: actAbove, review_above: reviewAbove },
         model: result.model,
+        provider: p.name,
         usage: result.usage,
         latency_ms,
       });
@@ -278,6 +524,7 @@ server.registerTool(
       action: GateSchema,
       thresholds: z.object({ act_above: z.number(), review_above: z.number() }),
       model: z.string(),
+      provider: ProviderSchema,
       usage: UsageSchema,
       latency_ms: LatencySchema,
     },
@@ -285,14 +532,15 @@ server.registerTool(
   async ({ state, question, levels, act_above, review_above }, extra) => {
     try {
       assertStateWithinLimit(state, maxStateChars.value);
-      if (levels.length > DEFAULT_MAX_SCORE_LEVELS) {
-        throw new Error(`levels must contain at most ${DEFAULT_MAX_SCORE_LEVELS} entries; received ${levels.length}.`);
+      if (levels.length > MAX_SCORE_LEVELS) {
+        throw new Error(`levels must contain at most ${MAX_SCORE_LEVELS} entries; received ${levels.length}. A Score question accepts up to 10 levels; this is an API limit.`);
       }
       const actAbove = act_above ?? 0.8;
       const reviewAbove = review_above ?? 0.5;
 
+      const p = getProvider();
       const started = performance.now();
-      const result = await getClient().systemOne(
+      const result = await p.systemOne(
         // zod already enforces two or more levels; the SDK types that as a tuple.
         { state, model: MODEL, questions: { rating: score(question, levels as unknown as ScoreCriteria) } },
         { signal: extra.signal },
@@ -308,6 +556,7 @@ server.registerTool(
         action: gateConfidence(answer.confidence, actAbove, reviewAbove),
         thresholds: { act_above: actAbove, review_above: reviewAbove },
         model: result.model,
+        provider: p.name,
         usage: result.usage,
         latency_ms,
       });
@@ -339,6 +588,7 @@ server.registerTool(
       verdict: z.enum(["yes", "no", "uncertain"]),
       thresholds: z.object({ yes_at_or_above: z.number(), no_at_or_below: z.number() }),
       model: z.string(),
+      provider: ProviderSchema,
       usage: UsageSchema,
       latency_ms: LatencySchema,
     },
@@ -355,8 +605,9 @@ server.registerTool(
           ? { true: yes_means ?? null, false: no_means ?? null }
           : undefined;
 
+      const p = getProvider();
       const started = performance.now();
-      const result = await getClient().systemOne(
+      const result = await p.systemOne(
         { state, model: MODEL, questions: { check: criteria ? noul(question, criteria) : noul(question) } },
         { signal: extra.signal },
       );
@@ -368,6 +619,7 @@ server.registerTool(
         verdict: gateProbability(probability, yesAt, noAt),
         thresholds: { yes_at_or_above: yesAt, no_at_or_below: noAt },
         model: result.model,
+        provider: p.name,
         usage: result.usage,
         latency_ms,
       });
@@ -410,6 +662,7 @@ server.registerTool(
       answers: z.record(z.any()).describe("Keyed by your question ids. Choice and Score answers also carry an 'action' gated on confidence."),
       none_options: z.record(z.string().nullable()).describe("For each 'classify' question, the key carrying the no-match meaning, or null."),
       model: z.string(),
+      provider: ProviderSchema,
       usage: UsageSchema,
       latency_ms: LatencySchema,
     },
@@ -438,8 +691,8 @@ server.registerTool(
           expected[q.id] = { type: "classify", keys: Object.keys(criteria) };
         } else if (q.type === "score") {
           if (!q.levels) throw new Error(`Question '${q.id}' is type 'score' and needs levels.`);
-          if (q.levels.length > DEFAULT_MAX_SCORE_LEVELS) {
-            throw new Error(`levels for '${q.id}' must contain at most ${DEFAULT_MAX_SCORE_LEVELS} entries.`);
+          if (q.levels.length > MAX_SCORE_LEVELS) {
+            throw new Error(`levels for '${q.id}' must contain at most ${MAX_SCORE_LEVELS} entries. A Score question accepts up to 10 levels; this is an API limit.`);
           }
           built[q.id] = score(q.question, q.levels as unknown as ScoreCriteria);
           expected[q.id] = { type: "score", levels: q.levels.length };
@@ -453,8 +706,9 @@ server.registerTool(
         }
       }
 
+      const p = getProvider();
       const started = performance.now();
-      const result = await getClient().systemOne({ state, model: MODEL, questions: built }, { signal: extra.signal });
+      const result = await p.systemOne({ state, model: MODEL, questions: built }, { signal: extra.signal });
       const latency_ms = Math.round(performance.now() - started);
 
       // Every question sent must come back well-formed. A missing answer is an
@@ -473,7 +727,7 @@ server.registerTool(
             : answer;
       }
 
-      return ok({ answers, none_options: noneOptions, model: result.model, usage: result.usage, latency_ms });
+      return ok({ answers, none_options: noneOptions, model: result.model, provider: p.name, usage: result.usage, latency_ms });
     } catch (error) {
       return fail(error);
     }
@@ -492,12 +746,14 @@ server.registerTool(
     outputSchema: {
       active_model: z.string().describe("The model these tools send requests to."),
       models: z.array(z.object({ name: z.string(), description: z.string(), release_date: z.string() })),
+      provider: ProviderSchema,
     },
   },
   async (_args, extra) => {
     try {
-      const models = await getClient().models.list({ signal: extra.signal });
-      return ok({ active_model: MODEL, models });
+      const p = getProvider();
+      const models = await p.listModels({ signal: extra.signal });
+      return ok({ active_model: MODEL, models, provider: p.name });
     } catch (error) {
       return fail(error);
     }
@@ -508,7 +764,7 @@ server.registerTool(
 
 async function main() {
   await server.connect(new StdioServerTransport());
-  console.error(`[jev-mcp] ready — version ${VERSION}, model ${MODEL}`);
+  console.error(`[jev-mcp] ready — version ${VERSION}, provider ${PROVIDER}, model ${MODEL}`);
 }
 
 main().catch((error) => {

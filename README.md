@@ -6,29 +6,39 @@ Jev is a System One model. It returns a typed answer and a calibrated probabilit
 distribution, never prose. These tools surface that faithfully rather than hiding
 it behind a label.
 
+It reaches Jev through either of two APIs, and uses whichever one your key belongs
+to: TypeSafe's own (`api.typesafe.ai`) or OpenRouter's Decisions API
+(`openrouter.ai/api/alpha/decisions`). Both serve the same model with the same
+question schema, so the tools behave identically. See [The key](#the-key).
+
 ## Install
 
-Requires Node 20.12+ and a TypeSafe API key from
-[console.typesafe.ai](https://console.typesafe.ai/settings/keys).
+Requires Node 20.12+ and a key for either path — see [The key](#the-key).
 
-### Claude Code plugin
+> **This is the `rahulrajaram` fork, version 0.5.0 and forward.** It adds the
+> OpenRouter access path and fixes two limits: Score questions are capped at the
+> API's 10 levels instead of 255, and the default state cap tracks Jev's ~32k-token
+> window instead of exceeding it. Upstream `rashedint32/jev-mcp` (npm
+> `jev-mcp@0.4.0`) has neither. Install from this fork, not from npm's `jev-mcp`.
 
-One marketplace add, one install. This registers the server and the agent skill
-together, so there is no separate skill step.
+### Install and update this fork
+
+All three paths run the same code. Pick one.
+
+**1. A local checkout — fastest launch, recommended when you have a clone.**
 
 ```bash
-/plugin marketplace add rashedInt32/jev-mcp
-/plugin install jev@jev-mcp
+git clone git@github.com:rahulrajaram/jev-mcp.git
+cd jev-mcp && npm ci && npm run build
+claude mcp add --scope user jev -- node "$PWD/dist/index.js"
 ```
 
-The plugin runs the published package through `npx -y jev-mcp@<version>`, so nothing
-needs building. The first launch downloads the package, so allow a few seconds before
-the server shows as connected in `claude mcp list`.
+Update: `git pull --ff-only && npm ci && npm run build`, then restart the client.
 
-### Any MCP client
+**2. Any MCP client, straight from git — no clone to maintain.**
 
 ```bash
-claude mcp add --scope user jev -- npx -y jev-mcp
+claude mcp add --scope user jev -- npx -y github:rahulrajaram/jev-mcp#main
 ```
 
 Or in a client's JSON config:
@@ -36,32 +46,84 @@ Or in a client's JSON config:
 ```json
 {
   "mcpServers": {
-    "jev": { "command": "npx", "args": ["-y", "jev-mcp"] }
+    "jev": { "command": "npx", "args": ["-y", "github:rahulrajaram/jev-mcp#main"] }
   }
 }
 ```
 
+`npx` installs the package from git, builds it once, and caches it per commit, so the
+next launch picks up a new commit. To force a rebuild, clear the cache with
+`npx --yes clear-npx-cache`, or re-run the `mcp add` with a specific commit.
+
+**3. Claude Code plugin — registers the server and the agent skill together.**
+
+```bash
+/plugin marketplace add rahulrajaram/jev-mcp
+/plugin install jev@jev-mcp
+```
+
+Update:
+
+```bash
+/plugin marketplace update jev-mcp
+/plugin update jev@jev-mcp
+```
+
+The plugin launches the same git spec through `npx`, so the first session builds once.
+
 Do not register the server directly **and** install the plugin. Two servers named
 `jev` will otherwise both register.
 
+### Upstream
+
+`rashedint32/jev-mcp` is the original, published to npm as `jev-mcp@0.4.0`: no
+OpenRouter path, and both limit defects. Do not mix it with this fork — installing
+`npx -y jev-mcp` or `/plugin marketplace add rashedInt32/jev-mcp` gives you that
+version. To follow upstream changes here:
+
+```bash
+git remote add upstream https://github.com/rashedint32/jev-mcp
+git fetch upstream && git merge upstream/main
+```
+
 ### The key
 
-The server reads the key from `TYPESAFE_API_KEY` in its environment, then from
-`JEV_API_KEY`, then from `~/.config/typesafe/key`. It is never a tool argument, so it
-cannot land in a transcript or in a model's context.
+The server picks the API your key belongs to. With no configuration it looks for a
+TypeSafe key first, then an OpenRouter key:
+
+| Path | Key sources, in order | API |
+| --- | --- | --- |
+| TypeSafe | `TYPESAFE_API_KEY`, `JEV_API_KEY`, `~/.config/typesafe/key` | `api.typesafe.ai` through the official SDK |
+| OpenRouter | `OPENROUTER_API_KEY`, `~/.config/openrouter/key` | `POST openrouter.ai/api/alpha/decisions` |
+
+Set `JEV_PROVIDER=typesafe` or `JEV_PROVIDER=openrouter` to pin one instead of
+letting the keys decide. The key is never a tool argument, so it cannot land in a
+transcript or in a model's context.
 
 The key file is the most reliable source, because some MCP clients strip the
 environment before spawning servers:
 
 ```sh
+# TypeSafe (key from console.typesafe.ai/settings/keys)
 mkdir -p ~/.config/typesafe
 printf '%s' "ts_..." > ~/.config/typesafe/key
 chmod 600 ~/.config/typesafe/key
+
+# OpenRouter (key from openrouter.ai/keys)
+mkdir -p ~/.config/openrouter
+printf '%s' "sk-or-..." > ~/.config/openrouter/key
+chmod 600 ~/.config/openrouter/key
 ```
 
 If you prefer the variable, put it in `~/.zshenv` rather than in any repo, and make
 sure it is **exported**. Without `export` the variable exists only in the shell that
 read it, and every server Claude Code spawns fails with a missing-key error.
+
+Model ids differ by path: TypeSafe takes `jev-latest` (the default) while OpenRouter
+takes `typesafe/jev-1.13` or the `~typesafe/jev-latest` alias (the default there),
+which the server applies for you unless you set `JEV_MODEL` yourself. OpenRouter also
+reports the per-call dollar `cost` in each result's `usage`; the TypeSafe API bills by
+input token and reports none.
 
 ### Plugin internals
 
@@ -96,7 +158,9 @@ missing-key error. Leaving `env` out keeps all three key sources live.
 
 Every tool returns the full probability distribution alongside the answer, plus
 `confidence` for Choice and Score. Results come back as MCP structured content, so a
-client gets typed data rather than a JSON string to re-parse.
+client gets typed data rather than a JSON string to re-parse. Each result also reports
+`provider` (which API served it), `model` (the model id that answered), and `usage`
+with `cost` when the provider reports it.
 
 ### Prefer `jev_ask`
 
@@ -158,19 +222,37 @@ Failures come back with `isError` and a classified body: `kind`, `retryable`, an
 where available `status`, `requestId`, and a `hint`. A rejected key (`authentication`,
 never retryable) is distinguishable from a rate limit (`rate_limit`, retryable) and
 from a malformed question (`invalid_request`) and from an answer that fails validation
-against the question (`malformed_response`, retryable, nothing to act on). The SDK
-already retries 408, 429, and 5xx with backoff before an error surfaces here.
+against the question (`malformed_response`, retryable, nothing to act on). Both
+providers are retried before an error surfaces here: the TypeSafe SDK does it on its
+path, and the OpenRouter client retries 408, 429, and 5xx with exponential backoff,
+honouring `Retry-After` when the response carries one. An OpenRouter `429` after those
+retries still arrives as `rate_limit`.
 
-Every judgment result also carries `latency_ms` for the API round trip, so calibration
-notes can record cost alongside confidence.
+Every judgment result also carries `latency_ms` for the API round trip and the
+`provider` that served it, so calibration notes can record cost alongside confidence.
 
 ### Limits
 
-A Choice question accepts at most 255 options, which is an API limit; past that,
-search in two passes, one question picking a window and a second ranking within it.
-Question count and state size are local caps that bound cost on a single call, and
-both are configurable. Oversized state is rejected rather than truncated, because
-truncating silently changes the material the judgment rests on.
+Jev's own limits, enforced here so a request the API would always reject never costs
+a round trip:
+
+| Limit | Value |
+| --- | --- |
+| Choice options | 255 per question |
+| Score levels | 10 per question |
+| Context | about 32k tokens shared by `state` and all questions, roughly 150,000 characters of English |
+| Input | text only; no image, audio, or video |
+| Language | English is strongest; other languages are handled but less well |
+| Rate | 250k tokens/s and 1,200 requests/min on the TypeSafe API |
+
+`JEV_MAX_QUESTIONS` (default 64) and `JEV_MAX_STATE_CHARS` (default 150,000) are local
+caps that bound one call's cost, sitting just under the API's own budget. Oversized
+state is rejected rather than truncated, because truncating silently changes the
+material the judgment rests on. Raise either if your workload packs tighter than
+English prose; the API remains the final arbiter.
+
+Past 255 options, search in two passes: one question picks a window, a second ranks
+within it.
 
 ## Agent skill
 
@@ -189,12 +271,17 @@ Point your client at the directory, or copy the file to `~/.claude/skills/jev/`.
 
 | Variable | Effect |
 | --- | --- |
-| `TYPESAFE_API_KEY` | Required. `JEV_API_KEY` also works. |
-| `JEV_MODEL` | Model id. Defaults to `jev-latest`. |
+| `TYPESAFE_API_KEY` | Required on the TypeSafe path. `JEV_API_KEY` also works. |
+| `OPENROUTER_API_KEY` | Required on the OpenRouter path. |
+| `JEV_PROVIDER` | `typesafe` or `openrouter`. Defaults to the API whose key is present, preferring TypeSafe. |
+| `JEV_MODEL` | Model id. Defaults to `jev-latest` (TypeSafe) or `~typesafe/jev-latest` (OpenRouter). |
+| `JEV_KEY_FILE` | Overrides `~/.config/typesafe/key`. |
+| `JEV_OR_KEY_FILE` | Overrides `~/.config/openrouter/key`. |
+| `OPENROUTER_BASE_URL` | Overrides `https://openrouter.ai`. Mainly for tests or a proxy. |
 | `JEV_TIMEOUT_MS` | Per-attempt timeout. Defaults to 15000. |
 | `JEV_MAX_QUESTIONS` | Questions per `jev_ask`. Defaults to 64. |
-| `JEV_MAX_STATE_CHARS` | Largest state accepted. Defaults to 200000. |
-| `TYPESAFE_LOG_LEVEL` | SDK verbosity. Safe at any level; all output goes to stderr. |
+| `JEV_MAX_STATE_CHARS` | Largest state accepted. Defaults to 150000, about 32k tokens of English. |
+| `TYPESAFE_LOG_LEVEL` | SDK verbosity on the TypeSafe path. Safe at any level; all output goes to stderr. |
 
 An unusable value for any numeric setting falls back to the default and warns on
 stderr, rather than becoming `NaN` and disabling the limit it was meant to enforce.
@@ -202,9 +289,20 @@ stderr, rather than becoming `NaN` and disabling the limit it was meant to enfor
 ## Troubleshooting
 
 **Every call reports a missing key.** Some MCP clients filter the environment before
-spawning servers, which drops `TYPESAFE_API_KEY`. Confirm the variable is exported,
-then pass it explicitly in the client's server config if it still does not arrive.
-Run `jev_models` to check the key in isolation.
+spawning servers, which drops `TYPESAFE_API_KEY` or `OPENROUTER_API_KEY`. Confirm the
+variable is exported, then pass it explicitly in the client's server config if it
+still does not arrive. Run `jev_models` to check the key in isolation.
+
+**A 401 from OpenRouter.** The message reads `User not found`. That is a rejected
+`OPENROUTER_API_KEY`, not a missing model. Check the key at openrouter.ai/keys and
+that you are not pointing `JEV_PROVIDER=openrouter` at a TypeSafe key.
+
+**A 404 on the model.** Check the id for the path: `jev-latest` on TypeSafe,
+`typesafe/jev-1.13` or `~typesafe/jev-latest` on OpenRouter.
+
+**A 400 naming too many score levels.** A Score question takes at most 10 levels. The
+server rejects that locally, so a 400 here means the level count came through some
+other route; reduce `levels`.
 
 **The server connects and then dies.** On a stdio transport, anything written to
 stdout that is not JSON-RPC breaks the connection. This server routes all logging to
@@ -235,26 +333,30 @@ npm ci
 npm run build
 npm run typecheck
 npm test          # offline: unit tests plus regression tests against a local stand-in
-npm run test:e2e  # live, requires TYPESAFE_API_KEY
+npm run test:e2e  # live, requires TYPESAFE_API_KEY or OPENROUTER_API_KEY
 ```
 
-Inside this repo the plugin's server fails to connect. `npx jev-mcp@<version>` sees a
-local project already named `jev-mcp` at that version, skips the registry, and looks
-for a bin that is never linked into the project's own `node_modules`. Every other
-directory is fine. For work in this checkout, register the local build directly and
-skip the plugin, since the plugin always launches the published version:
+Inside this repo the plugin's server is not the one you want: the plugin resolves its
+own copy from git, not from this checkout, so it runs the last pushed commit rather
+than your working tree. For work here, register the local build directly and skip the
+plugin:
 
 ```bash
 claude mcp add --scope user jev -- node /absolute/path/to/jev-mcp/dist/index.js
 ```
 
-Releasing: bump `version` in `package.json`, `.claude-plugin/plugin.json`, and
-`.claude-plugin/marketplace.json` together, then `npm publish`. The plugin cache is
-keyed by version, so an unbumped plugin keeps serving the old snapshot.
+Releasing this fork: bump `version` in `package.json`, `.claude-plugin/plugin.json`,
+and `.claude-plugin/marketplace.json` together, commit, and push. Git-based installs
+(`github:rahulrajaram/jev-mcp#main`) pick the new commit up on the next launch, and
+`/plugin update jev@jev-mcp` refreshes a plugin install. Publishing to npm requires a
+package name you own — `jev-mcp` on npm belongs to upstream — so use a scope such as
+`@rahulrajaram/jev-mcp` if you ever publish, and update the plugin's `args` to match;
+until then, keep the fork's plugin pointed at the git spec so it cannot resolve to
+upstream's 0.4.0.
 
-The offline suite runs the real built server over stdio against a local stand-in for
-the TypeSafe API and asserts on the request bodies it actually sends, so a regression
-in what reaches the model fails the build.
+The offline suite runs the real built server over stdio against local stand-ins for
+the TypeSafe and OpenRouter APIs and asserts on the request bodies it actually sends,
+so a regression in what reaches the model fails the build.
 
 ## License
 
