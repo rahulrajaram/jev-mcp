@@ -308,6 +308,7 @@ export class ProviderNetworkError extends Error {
 export type ErrorKind =
   | "no_api_key"
   | "authentication"
+  | "insufficient_credits"
   | "permission_denied"
   | "invalid_request"
   | "not_found"
@@ -346,6 +347,14 @@ export function describeError(error: unknown): DescribedError {
     const base = { message, status: error.status, requestId: error.requestId };
     if (error.status === 401) {
       return { ...base, kind: "authentication", retryable: false, hint: "The API key was rejected. Check the key for the active provider (TYPESAFE_API_KEY or OPENROUTER_API_KEY) in the server's environment." };
+    }
+    if (error.status === 402) {
+      return {
+        ...base,
+        kind: "insufficient_credits",
+        retryable: false,
+        hint: "The provider account cannot afford this request, so retrying it unchanged will fail the same way. Add credits (openrouter.ai/settings/credits on the OpenRouter path) or send a smaller state. A full-budget Jev request costs well under a cent, so this usually means a shared account balance is exhausted rather than Jev being expensive.",
+      };
     }
     if (error.status === 403) {
       return { ...base, kind: "permission_denied", retryable: false, hint: "The key is valid but lacks access to this model or account." };

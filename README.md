@@ -231,6 +231,12 @@ retries still arrives as `rate_limit`.
 Every judgment result also carries `latency_ms` for the API round trip and the
 `provider` that served it, so calibration notes can record cost alongside confidence.
 
+An exhausted provider balance is its own kind, `insufficient_credits` (HTTP 402), with
+a hint pointing at the credits page. It is never retried: the same request fails until
+a human adds funds or the state shrinks. Jev is cheap enough that this usually means a
+shared account is out of credit rather than the call being large — a full-budget Jev
+request costs well under a cent.
+
 ### Limits
 
 Jev's own limits, enforced here so a request the API would always reject never costs
@@ -299,6 +305,11 @@ that you are not pointing `JEV_PROVIDER=openrouter` at a TypeSafe key.
 
 **A 404 on the model.** Check the id for the path: `jev-latest` on TypeSafe,
 `typesafe/jev-1.13` or `~typesafe/jev-latest` on OpenRouter.
+
+**A 402 reports `insufficient_credits`.** The OpenRouter balance cannot cover the
+request, so add credits at openrouter.ai/settings/credits or shrink the state. If the
+balance is shared with other models, give Jev its own TypeSafe key instead
+(`JEV_PROVIDER=typesafe`) so a busy large-context session cannot starve the judgments.
 
 **A 400 naming too many score levels.** A Score question takes at most 10 levels. The
 server rejects that locally, so a 400 here means the level count came through some

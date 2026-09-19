@@ -238,6 +238,7 @@ test("backoffDelayMs grows exponentially and caps", () => {
 test("describeError classifies provider HTTP errors a caller can branch on", () => {
   const cases = [
     [401, "authentication", false],
+    [402, "insufficient_credits", false],
     [403, "permission_denied", false],
     [404, "not_found", false],
     [408, "timeout", true],

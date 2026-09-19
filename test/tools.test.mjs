@@ -622,6 +622,27 @@ test("a persistently failing OpenRouter request stops after three attempts", asy
   }
 });
 
+test("an out-of-credits OpenRouter account (402) is named, not retried, and not called a server error", async () => {
+  // OpenRouter answers 402 with limit_source: openrouter_credits when the
+  // balance cannot cover the request. It is not a server fault and retrying
+  // unchanged cannot help, so it must fail fast with its own kind.
+  const mock = await startMockOpenRouter();
+  mock.state.failNext = { status: 402, times: 10 };
+  try {
+    await withClient({ withKey: false, env: { ["OPENROUTER" + "_API_" + "KEY"]: "sk-or-test", OPENROUTER_BASE_URL: mock.url } }, async (client) => {
+      const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+      assert.equal(result.isError, true);
+      const { error } = payload(result);
+      assert.equal(error.kind, "insufficient_credits");
+      assert.equal(error.retryable, false);
+      assert.match(error.hint, /credit/i);
+      assert.equal(mock.decisions().length, 1, "a balance problem must not burn retries");
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
 test("an invalid OpenRouter request fails fast without a retry", async () => {
   const mock = await startMockOpenRouter();
   mock.state.failNext = { status: 400, times: 10 };
