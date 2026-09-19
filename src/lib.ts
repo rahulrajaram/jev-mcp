@@ -294,6 +294,17 @@ function autoProvider(typesafeKeyPresent: boolean, openrouterKeyPresent: boolean
   return "typesafe";
 }
 
+/**
+ * Whether a bare file looks like an OpenRouter key.
+ *
+ * `~/.openrouter` is a path some operators already keep a key in. A file there
+ * is only used when its content actually looks like a key, so an unrelated file
+ * at that path is ignored instead of being sent as a credential.
+ */
+export function looksLikeOpenRouterKey(value: string): boolean {
+  return /^sk-or-[A-Za-z0-9._-]{8,}$/.test(value.trim());
+}
+
 // ── Retry helpers (pure, so the policy is unit-testable) ─────────────────────
 
 /**

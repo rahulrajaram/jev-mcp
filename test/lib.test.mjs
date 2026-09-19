@@ -11,6 +11,7 @@ import {
   describeError,
   gateConfidence,
   gateProbability,
+  looksLikeOpenRouterKey,
   MalformedResponseError,
   MAX_CHOICE_OPTIONS,
   MAX_SCORE_LEVELS,
@@ -291,4 +292,15 @@ test("describeError maps provider transport failures to their kinds", () => {
   const cancelled = describeError(abort);
   assert.equal(cancelled.kind, "cancelled");
   assert.equal(cancelled.retryable, false);
+});
+
+test("looksLikeOpenRouterKey accepts a key and ignores anything else", () => {
+  assert.ok(looksLikeOpenRouterKey("sk-or-v1-" + "a".repeat(64)));
+  assert.ok(looksLikeOpenRouterKey("  sk-or-v1-abc12345\n"));
+  assert.ok(!looksLikeOpenRouterKey("not a key"));
+  assert.ok(!looksLikeOpenRouterKey("sk-or-"));
+  assert.ok(!looksLikeOpenRouterKey("sk-or-v1-ab"), "a token too short to be a key is not one");
+  assert.ok(!looksLikeOpenRouterKey("sk-other-v1-" + "a".repeat(64)));
+  assert.ok(!looksLikeOpenRouterKey("sk-or-v1-aaaa bbbb"));
+  assert.ok(!looksLikeOpenRouterKey(""));
 });

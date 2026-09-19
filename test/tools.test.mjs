@@ -880,3 +880,45 @@ test("regression: the scope guide keeps its substance, not just its markers", as
     }
   });
 });
+
+test("uses a bare ~/.openrouter key file, and only when it looks like a key", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  // A key at ~/.openrouter is picked up with no configuration at all.
+  const homeWithKey = mkdtempSync(join(tmpdir(), "jev-home-"));
+  writeFileSync(join(homeWithKey, ".openrouter"), "sk-or-v1-" + "a".repeat(64) + "\n", { mode: 0o600 });
+  const mock = await startMockOpenRouter();
+  try {
+    await withClient(
+      { withKey: false, bareKeyFile: null, env: { HOME: homeWithKey, OPENROUTER_BASE_URL: mock.url, JEV_OR_KEY_FILE: "/nonexistent/jev-mcp-test/or-key" } },
+      async (client) => {
+        const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+        assert.notEqual(result.isError, true, "the bare key file should satisfy the credential check");
+        assert.equal(payload(result).provider, "openrouter");
+        assert.match(mock.decisions()[0].auth, /^Bearer sk-or-v1-aaaa/);
+      },
+    );
+  } finally {
+    await mock.close();
+  }
+
+  // A file there that is not a key must not be sent as a credential.
+  const homeWithout = mkdtempSync(join(tmpdir(), "jev-home-"));
+  writeFileSync(join(homeWithout, ".openrouter"), "some other tool's config\n");
+  const mock2 = await startMockOpenRouter();
+  try {
+    await withClient(
+      { withKey: false, bareKeyFile: null, env: { HOME: homeWithout, OPENROUTER_BASE_URL: mock2.url, JEV_OR_KEY_FILE: "/nonexistent/jev-mcp-test/or-key" } },
+      async (client) => {
+        const result = await client.callTool({ name: "jev_check", arguments: { state: "s", question: "q" } });
+        assert.equal(result.isError, true);
+        assert.equal(payload(result).error.kind, "no_api_key", "a non-key file must be ignored, not used");
+        assert.equal(mock2.requests.length, 0);
+      },
+    );
+  } finally {
+    await mock2.close();
+  }
+});

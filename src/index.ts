@@ -45,6 +45,7 @@ import {
   describeError,
   gateConfidence,
   gateProbability,
+  looksLikeOpenRouterKey,
   MalformedResponseError,
   MAX_CHOICE_OPTIONS,
   MAX_SCORE_LEVELS,
@@ -118,6 +119,8 @@ for (const setting of [timeout, maxQuestions, maxStateChars]) {
  */
 const KEY_FILE = process.env.JEV_KEY_FILE ?? join(homedir(), ".config", "typesafe", "key");
 const OR_KEY_FILE = process.env.JEV_OR_KEY_FILE ?? join(homedir(), ".config", "openrouter", "key");
+/** A bare key file some operators already keep, accepted only if it looks like one. */
+const OR_BARE_KEY_FILE = process.env.JEV_OR_BARE_KEY_FILE ?? join(homedir(), ".openrouter");
 const OR_BASE_URL = (process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai").replace(/\/+$/, "");
 
 function readKeyFile(file: string): string | undefined {
@@ -129,8 +132,23 @@ function readKeyFile(file: string): string | undefined {
   }
 }
 
-const typesafeKeyPresent = Boolean(process.env.TYPESAFE_API_KEY ?? process.env.JEV_API_KEY ?? readKeyFile(KEY_FILE));
-const openrouterKeyPresent = Boolean(process.env.OPENROUTER_API_KEY ?? readKeyFile(OR_KEY_FILE));
+/** Every OpenRouter key source, in order, so presence and use agree. */
+function openRouterKey(): string | undefined {
+  const fromEnv = process.env.OPENROUTER_API_KEY?.trim();
+  if (fromEnv) return fromEnv;
+  const fromFile = readKeyFile(OR_KEY_FILE);
+  if (fromFile) return fromFile;
+  const bare = readKeyFile(OR_BARE_KEY_FILE);
+  return bare !== undefined && looksLikeOpenRouterKey(bare) ? bare : undefined;
+}
+
+/** Every TypeSafe key source, in order. */
+function typeSafeKey(): string | undefined {
+  return process.env.TYPESAFE_API_KEY ?? process.env.JEV_API_KEY ?? readKeyFile(KEY_FILE);
+}
+
+const typesafeKeyPresent = Boolean(typeSafeKey());
+const openrouterKeyPresent = Boolean(openRouterKey());
 const resolvedProvider = resolveProvider(process.env.JEV_PROVIDER, typesafeKeyPresent, openrouterKeyPresent);
 if (resolvedProvider.warning) console.error(`[jev-mcp] ${resolvedProvider.warning}`);
 const PROVIDER = resolvedProvider.provider;
@@ -403,15 +421,15 @@ let provider: JudgmentProvider | undefined;
 function getProvider(): JudgmentProvider {
   if (provider) return provider;
   if (PROVIDER === "openrouter") {
-    const apiKey = process.env.OPENROUTER_API_KEY ?? readKeyFile(OR_KEY_FILE);
+    const apiKey = openRouterKey();
     if (!apiKey) {
       throw new Error(
-        `No API key. Set OPENROUTER_API_KEY in the environment of the MCP client, or create ${OR_KEY_FILE} with mode 0600. Never pass it as a tool argument.`,
+        `No API key. Set OPENROUTER_API_KEY in the environment of the MCP client, or create ${OR_KEY_FILE} or ${OR_BARE_KEY_FILE} with mode 0600. Never pass it as a tool argument.`,
       );
     }
     provider = new OpenRouterProvider(apiKey);
   } else {
-    const apiKey = process.env.TYPESAFE_API_KEY ?? process.env.JEV_API_KEY ?? readKeyFile(KEY_FILE);
+    const apiKey = typeSafeKey();
     if (!apiKey) {
       throw new Error(
         `No API key. Set TYPESAFE_API_KEY in the environment of the MCP client, or create ${KEY_FILE} with mode 0600. Never pass it as a tool argument.`,

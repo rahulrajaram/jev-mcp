@@ -223,18 +223,21 @@ export async function startMockOpenRouter() {
  * is how the missing-key path is exercised. An OpenRouter key is always passed
  * through `env` so a test chooses its own provider.
  */
-export async function withClient({ baseUrl, withKey = true, env = {} } = {}, fn) {
-  // Pin both key-file fallbacks at paths that cannot exist. HOME is passed
+export async function withClient({ baseUrl, withKey = true, env = {}, bareKeyFile = "/nonexistent/jev-mcp-test/bare-or" } = {}, fn) {
+  // Pin every key-file fallback at a path that cannot exist. HOME is passed
   // through, so without this the suite would start reading a real
-  // ~/.config/typesafe/key or ~/.config/openrouter/key the moment one exists,
-  // and the missing-key tests would quietly begin making live calls instead of
-  // exercising the failure path. A test that needs a fallback passes the
-  // JEV_KEY_FILE or JEV_OR_KEY_FILE env explicitly.
+  // ~/.config/typesafe/key, ~/.config/openrouter/key or ~/.openrouter the
+  // moment one exists, and the missing-key tests would quietly begin making
+  // live calls instead of exercising the failure path. A test that needs a
+  // fallback passes the JEV_KEY_FILE, JEV_OR_KEY_FILE or bareKeyFile explicitly.
   const childEnv = {
     PATH: process.env.PATH,
     HOME: process.env.HOME,
     JEV_KEY_FILE: "/nonexistent/jev-mcp-test/key",
     JEV_OR_KEY_FILE: "/nonexistent/jev-mcp-test/or-key",
+    // A real ~/.openrouter key would otherwise turn a missing-key test into a
+    // live API call. Pass bareKeyFile: null to exercise the default path.
+    ...(bareKeyFile === null ? {} : { JEV_OR_BARE_KEY_FILE: bareKeyFile }),
     ...env,
   };
   if (baseUrl) childEnv.TYPESAFE_BASE_URL = baseUrl;

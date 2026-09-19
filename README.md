@@ -94,7 +94,11 @@ TypeSafe key first, then an OpenRouter key:
 | Path | Key sources, in order | API |
 | --- | --- | --- |
 | TypeSafe | `TYPESAFE_API_KEY`, `JEV_API_KEY`, `~/.config/typesafe/key` | `api.typesafe.ai` through the official SDK |
-| OpenRouter | `OPENROUTER_API_KEY`, `~/.config/openrouter/key` | `POST openrouter.ai/api/alpha/decisions` |
+| OpenRouter | `OPENROUTER_API_KEY`, `~/.config/openrouter/key`, `~/.openrouter` | `POST openrouter.ai/api/alpha/decisions` |
+
+A bare `~/.openrouter` file is accepted as the last source, and only when its content
+actually looks like an OpenRouter key — an unrelated file at that path is ignored
+rather than sent as a credential. `JEV_OR_BARE_KEY_FILE` overrides that path.
 
 Set `JEV_PROVIDER=typesafe` or `JEV_PROVIDER=openrouter` to pin one instead of
 letting the keys decide. The key is never a tool argument, so it cannot land in a
@@ -318,6 +322,7 @@ Point your client at the directory, or copy the file to `~/.claude/skills/jev/`.
 | `JEV_MODEL` | Model id. Defaults to `jev-latest` (TypeSafe) or `~typesafe/jev-latest` (OpenRouter). |
 | `JEV_KEY_FILE` | Overrides `~/.config/typesafe/key`. |
 | `JEV_OR_KEY_FILE` | Overrides `~/.config/openrouter/key`. |
+| `JEV_OR_BARE_KEY_FILE` | Overrides `~/.openrouter`, the bare-file fallback source. |
 | `OPENROUTER_BASE_URL` | Overrides `https://openrouter.ai`. Mainly for tests or a proxy. |
 | `JEV_TIMEOUT_MS` | Per-attempt timeout. Defaults to 15000. |
 | `JEV_MAX_QUESTIONS` | Questions per `jev_ask`. Defaults to 64. |
@@ -332,7 +337,9 @@ stderr, rather than becoming `NaN` and disabling the limit it was meant to enfor
 **Every call reports a missing key.** Some MCP clients filter the environment before
 spawning servers, which drops `TYPESAFE_API_KEY` or `OPENROUTER_API_KEY`. Confirm the
 variable is exported, then pass it explicitly in the client's server config if it
-still does not arrive. Run `jev_models` to check the key in isolation.
+still does not arrive. A key file reaches every spawn path, so `~/.openrouter`,
+`~/.config/openrouter/key` or `~/.config/typesafe/key` are the reliable sources. Run
+`jev_models` to check the key in isolation.
 
 **A 401 from OpenRouter.** The message reads `User not found`. That is a rejected
 `OPENROUTER_API_KEY`, not a missing model. Check the key at openrouter.ai/keys and
