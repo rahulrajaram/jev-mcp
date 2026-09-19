@@ -29,6 +29,17 @@ import type { EntryType } from "@typesafe-ai/sdk";
 export const MAX_CHOICE_OPTIONS = 255;
 
 /**
+ * Jev's request budget in tokens, shared by the state and all questions. The
+ * docs put it at "around 32,000 tokens, roughly 150,000 characters of English"
+ * (docs.typesafe.ai/primitives), and the OpenRouter catalog lists a 32,000
+ * context window. Reported by jev_models so a caller can size a call before
+ * building it. Approximate on purpose: a measured probe showed terse,
+ * repetitive text costing about 2 characters per token, where English prose
+ * runs nearer 4, so a character count is only a proxy.
+ */
+export const CONTEXT_TOKENS = 32_000;
+
+/**
  * A Score question accepts up to 10 levels. This is a documented API limit
  * (docs.typesafe.ai/primitives/score, "up to 10"), confirmed on the wire: 11
  * levels returns HTTP 400, "Too many score levels. Must have at most 10
@@ -169,8 +180,9 @@ export function assertStateWithinLimit(state: unknown, maxChars: number): void {
   const size = stateSize(state);
   if (size > maxChars) {
     throw new Error(
-      `State is ${size} characters, above the ${maxChars} limit. ` +
-        "Shorten it or select the relevant part first; raise JEV_MAX_STATE_CHARS if the limit is wrong for your workload.",
+      `State is ${size} characters (~${Math.round(size / 4)} tokens of English), above the ${maxChars} limit. ` +
+        "Jev's request budget is about 32,000 tokens shared by the state and every question, so filter in code first and send only the fields the questions need: the paragraph, the diff hunk, the record — not the whole file, log, or transcript. " +
+        "Raise JEV_MAX_STATE_CHARS only if your state packs tighter than English prose; the API rejects a genuine overflow with max_tokens_exceeded either way.",
     );
   }
 }

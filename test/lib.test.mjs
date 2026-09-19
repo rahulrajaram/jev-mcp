@@ -88,6 +88,10 @@ test("state size is measured, and oversized state is rejected not truncated", ()
 
   assert.doesNotThrow(() => assertStateWithinLimit("abc", 10));
   assert.throws(() => assertStateWithinLimit("a".repeat(20), 10), /above the 10 limit/);
+  // The error must teach the budget, not just refuse: a caller that only sees
+  // "too long" will retry with the same oversized state.
+  assert.throws(() => assertStateWithinLimit("a".repeat(400), 100), /~100 tokens/);
+  assert.throws(() => assertStateWithinLimit("a".repeat(400), 100), /32,000 tokens shared by the state and every question/);
 });
 
 test("gateConfidence maps confidence onto an action", () => {

@@ -260,6 +260,33 @@ English prose; the API remains the final arbiter.
 Past 255 options, search in two passes: one question picks a window, a second ranks
 within it.
 
+### Budgeting the state
+
+Jev's entire request budget — state plus every question — is about **32,000 tokens**.
+English prose runs near 4 characters per token, which is where the 150,000-character
+default comes from, but that ratio is not a constant: terse, repetitive, or
+code-like text costs far more tokens per character. A measured probe of `"x "`
+repeated ran at about **2 characters per token**, so a state that looks comfortably
+under 150,000 characters can still exhaust the budget.
+
+Two guards, in order:
+
+1. The server rejects a state beyond `JEV_MAX_STATE_CHARS` **before** any request goes
+   out, and the error names the estimate in tokens and asks for a filtered state.
+2. The API is the final arbiter. A genuine overflow returns `400
+   max_tokens_exceeded`, never a credit or server error.
+
+So the working habit is: build the state in code from the fields the question needs,
+not from the document you happen to have. When the decision depends on locating the
+right part of something large, do it in two passes — one [Noul](/primitives) per
+candidate passage to filter relevance, then a second call over the passages that
+survived. Accuracy also falls as irrelevant state grows, so filtering is not only a
+budget measure.
+
+Call `jev_models` to read the effective limits (context budget, state cap, question
+cap, option cap, level cap) before building a large call; the caps reflect
+`JEV_MAX_STATE_CHARS` and `JEV_MAX_QUESTIONS` as configured.
+
 ## Agent skill
 
 `skills/jev/SKILL.md` teaches an agent when to reach for these tools and how to shape
@@ -310,6 +337,11 @@ that you are not pointing `JEV_PROVIDER=openrouter` at a TypeSafe key.
 request, so add credits at openrouter.ai/settings/credits or shrink the state. If the
 balance is shared with other models, give Jev its own TypeSafe key instead
 (`JEV_PROVIDER=typesafe`) so a busy large-context session cannot starve the judgments.
+
+**A 400 reports `max_tokens_exceeded`.** The state plus questions genuinely exceeded
+Jev's ~32k-token budget, which a character count cannot always predict. Filter the
+state in code; do not raise `JEV_MAX_STATE_CHARS` for this, since the API rejects it
+anyway.
 
 **A 400 naming too many score levels.** A Score question takes at most 10 levels. The
 server rejects that locally, so a 400 here means the level count came through some

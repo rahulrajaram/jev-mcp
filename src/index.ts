@@ -38,6 +38,7 @@ import {
   assertUniqueIds,
   backoffDelayMs,
   buildChoiceCriteria,
+  CONTEXT_TOKENS,
   DEFAULT_MAX_QUESTIONS,
   DEFAULT_MAX_STATE_CHARS,
   DEFAULT_TIMEOUT_MS,
@@ -45,6 +46,7 @@ import {
   gateConfidence,
   gateProbability,
   MalformedResponseError,
+  MAX_CHOICE_OPTIONS,
   MAX_SCORE_LEVELS,
   parseRetryAfterSeconds,
   ProviderHttpError,
@@ -146,7 +148,11 @@ const MODEL = process.env.JEV_MODEL ?? (PROVIDER === "openrouter" ? "~typesafe/j
  */
 const StateSchema = z
   .union([z.string(), z.record(z.any()), z.array(z.any())])
-  .describe("The content to evaluate. A plain string for text, or an object/array for structured data such as a record, a diff, or a chat log.");
+  .describe(
+    "The content to evaluate: a plain string for text, or an object/array for structured data such as a record, a diff, or a chat log. " +
+      "Jev's entire request budget is about 32,000 tokens, shared by this state and every question, which is roughly 150,000 characters of English but varies with content — terse or repetitive text costs more tokens per character. " +
+      "Filter in code and send only the fields the question needs. This server rejects an oversized state rather than truncating it, because truncation silently changes the material the judgment rests on.",
+  );
 
 /** Instructions accept JSON structure, which helps when a question has parts. */
 const InstructionSchema = z
@@ -637,6 +643,7 @@ server.registerTool(
     title: "Ask many questions about one state",
     description:
       "Ask several independent questions about the same state in ONE request. Jev prefills the state once and scores every question in a single forward pass, so extra questions add almost no latency. " +
+      "Questions share the request's ~32,000-token budget with the state, so filter the state before adding questions rather than growing the call. " +
       "Prefer this over repeated single-question calls: on a document-dominated workload it is dramatically cheaper and faster with no change in answers. " +
       "Questions cannot see each other's answers, so state any speculative premise explicitly and let your own logic decide which answers apply.",
     inputSchema: {
@@ -739,21 +746,40 @@ server.registerTool(
 server.registerTool(
   "jev_models",
   {
-    title: "List available models",
+    title: "List available models and the effective limits",
     description:
-      "List the models this API key can use, with their release dates. Use it to confirm the key works and to find a model id for JEV_MODEL before assuming one exists.",
+      "List the models this API key can use, with their release dates, and report the limits this server enforces (context budget, largest state, questions per call, options per Choice, levels per Score). " +
+      "Use it to confirm the key works, to find a model id for JEV_MODEL before assuming one exists, and to size a large call before building it.",
     inputSchema: {},
     outputSchema: {
       active_model: z.string().describe("The model these tools send requests to."),
       models: z.array(z.object({ name: z.string(), description: z.string(), release_date: z.string() })),
       provider: ProviderSchema,
+      limits: z.object({
+        context_tokens: z.number().describe("Jev's request budget in tokens, shared by the state and every question. Approximate: the real ratio depends on content."),
+        max_state_chars: z.number().describe("Largest state accepted, in characters (JEV_MAX_STATE_CHARS)."),
+        max_questions: z.number().describe("Questions allowed in one jev_ask call (JEV_MAX_QUESTIONS)."),
+        max_choice_options: z.number().describe("Options allowed per Choice question."),
+        max_score_levels: z.number().describe("Levels allowed per Score question."),
+      }),
     },
   },
   async (_args, extra) => {
     try {
       const p = getProvider();
       const models = await p.listModels({ signal: extra.signal });
-      return ok({ active_model: MODEL, models, provider: p.name });
+      return ok({
+        active_model: MODEL,
+        models,
+        provider: p.name,
+        limits: {
+          context_tokens: CONTEXT_TOKENS,
+          max_state_chars: maxStateChars.value,
+          max_questions: maxQuestions.value,
+          max_choice_options: MAX_CHOICE_OPTIONS,
+          max_score_levels: MAX_SCORE_LEVELS,
+        },
+      });
     } catch (error) {
       return fail(error);
     }

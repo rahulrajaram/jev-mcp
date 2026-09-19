@@ -336,6 +336,14 @@ test("jev_models reports the active model and what the key can use", async () =>
       const body = payload(await client.callTool({ name: "jev_models", arguments: {} }));
       assert.equal(body.active_model, "jev-latest");
       assert.equal(body.models[0].name, "jev-latest");
+      // A caller should be able to size a call from one cheap call.
+      assert.deepEqual(body.limits, {
+        context_tokens: 32000,
+        max_state_chars: 150000,
+        max_questions: 64,
+        max_choice_options: 255,
+        max_score_levels: 10,
+      });
     });
   } finally {
     await mock.close();
